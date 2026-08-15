@@ -1208,15 +1208,15 @@ func acquireIdentityLock(ctx RoleContext) error {
 	// Create lock for this worker directory
 	l := lock.New(ctx.WorkDir)
 
-	// Determine session ID from environment or context
-	sessionID := os.Getenv("TMUX_PANE")
-	if sessionID == "" {
-		// Fall back to a descriptive identifier
-		sessionID = fmt.Sprintf("%s/%s", ctx.Rig, ctx.Polecat)
-	}
+	// Resolve the agent that owns this identity. `gt prime` is a short-lived
+	// child of the agent (SessionStart hook), so recording our own PID would
+	// mark every live agent's lock stale seconds later, and TMUX_PANE is a pane
+	// id rather than a session id. ResolveAgentOwner records the tmux pane
+	// process and the real session name instead (gt-85p).
+	owner := lock.ResolveAgentOwner(fmt.Sprintf("%s/%s", ctx.Rig, ctx.Polecat))
 
 	// Try to acquire the lock
-	if err := l.Acquire(sessionID); err != nil {
+	if err := l.AcquireAs(owner); err != nil {
 		if errors.Is(err, lock.ErrLocked) {
 			// Another agent owns this identity
 			fmt.Printf("\n%s\n\n", style.Bold.Render("⚠️  IDENTITY COLLISION DETECTED"))

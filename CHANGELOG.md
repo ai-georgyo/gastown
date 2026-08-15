@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`gt polecat check-recovery` no longer tells you to nuke a working polecat**
+  (gt-85p / hq-fhb). The decision engine correctly returned `WORKING` for a
+  live, mid-task polecat, but the human-readable renderer switched on the
+  verdict string with a `default:` arm that printed
+  `SAFE_TO_NUKE — no work at risk`. Every verdict the renderer did not name
+  explicitly — `WORKING`, `STALLED`, anything added later — was rendered as safe
+  to destroy, and that text is what the Witness cleanup checklist reads before
+  nuking a sandbox and its unmerged commits. Safety is now rendered only from
+  `safe_to_nuke`, and an unrecognized verdict reports itself and refuses.
+  `check-recovery` additionally requires positive proof the agent is gone:
+  a live agent, or a liveness probe that fails, can no longer yield
+  `SAFE_TO_NUKE`. An empty `cleanup_status` now prints as
+  `unknown (not reported)` instead of a blank field.
+- **Agent identity locks record the agent, not the CLI process that wrote them**
+  (gt-85p). `gt prime` runs as a short-lived child of the agent, so writing
+  `os.Getpid()` into `.runtime/agent.lock` marked every live agent's lock stale
+  seconds later; `session_id` also held `TMUX_PANE` — a pane id such as `%20`,
+  not a session id — which made lock/session cross-checks depend on a numeric
+  coincidence between pane and session ids. Locks now record the tmux pane
+  process (which outlives every CLI child), the real session name, the pane id
+  in its own field, and a `pid_source` so readers can tell whether a dead PID is
+  evidence of anything.
+
 ## [1.2.1] - 2026-06-06
 
 ### Fixed
