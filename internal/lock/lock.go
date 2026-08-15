@@ -30,15 +30,31 @@ var (
 
 // LockInfo contains information about who holds a lock.
 type LockInfo struct {
-	PID       int       `json:"pid"`
+	PID        int       `json:"pid"`
 	AcquiredAt time.Time `json:"acquired_at"`
-	SessionID string    `json:"session_id,omitempty"`
-	Hostname  string    `json:"hostname,omitempty"`
+	SessionID  string    `json:"session_id,omitempty"`
+	PaneID     string    `json:"pane_id,omitempty"`
+	PIDSource  string    `json:"pid_source,omitempty"`
+	Hostname   string    `json:"hostname,omitempty"`
 }
 
 // IsStale checks if the lock is stale (owning process is dead).
 func (l *LockInfo) IsStale() bool {
 	return !processExists(l.PID)
+}
+
+// OwnerAlive reports whether the recorded owner process is running.
+// It is the positive half of IsStale, stated explicitly for consumers that must
+// require proof of life rather than infer it from an absence of evidence.
+func (l *LockInfo) OwnerAlive() bool {
+	return processExists(l.PID)
+}
+
+// PIDIsAgentAnchored reports whether PID identifies the agent's own long-lived
+// process rather than the (possibly short-lived) process that wrote the lock.
+// A dead PID is only evidence the agent exited when this is true.
+func (l *LockInfo) PIDIsAgentAnchored() bool {
+	return l.PIDSource == OwnerSourceTmuxPane
 }
 
 // Lock represents an agent identity lock for a worker directory.
@@ -55,13 +71,31 @@ func New(workerDir string) *Lock {
 	}
 }
 
-// Acquire attempts to acquire the lock for this worker.
+// Acquire attempts to acquire the lock for this worker, recording the CALLING
+// process as the owner.
+//
+// Agent entrypoints must use AcquireAs(ResolveAgentOwner(...)) instead: a lock
+// that records a short-lived CLI process goes stale the moment that process
+// exits, even though the agent is still working (gt-85p).
+//
+// Returns ErrLocked if another live process holds the lock.
+// Automatically cleans up stale locks.
+func (l *Lock) Acquire(sessionID string) error {
+	return l.AcquireAs(Owner{PID: os.Getpid(), SessionID: sessionID, Source: OwnerSourceProcess})
+}
+
+// AcquireAs attempts to acquire the lock on behalf of the given owner.
 // Returns ErrLocked if another live process holds the lock.
 // Automatically cleans up stale locks.
 //
 // Uses OS-level advisory locking (flock) to prevent TOCTOU races
 // where two processes could both see no lock and both write one.
-func (l *Lock) Acquire(sessionID string) error {
+func (l *Lock) AcquireAs(owner Owner) error {
+	if owner.PID <= 0 {
+		owner.PID = os.Getpid()
+		owner.Source = OwnerSourceProcess
+	}
+
 	// Ensure .runtime directory exists before flock
 	dir := filepath.Dir(l.lockPath)
 	if err := os.MkdirAll(dir, 0755); err != nil {
@@ -87,9 +121,9 @@ func (l *Lock) Acquire(sessionID string) error {
 			}
 		} else {
 			// Active lock - check if it's us
-			if info.PID == os.Getpid() {
+			if info.PID == owner.PID {
 				// We already hold it - refresh
-				return l.write(sessionID)
+				return l.write(owner)
 			}
 			// Another process holds it
 			return fmt.Errorf("%w: PID %d (session: %s, acquired: %s)",
@@ -98,7 +132,7 @@ func (l *Lock) Acquire(sessionID string) error {
 	}
 
 	// No lock or stale lock removed - acquire it
-	return l.write(sessionID)
+	return l.write(owner)
 }
 
 // Release releases the lock if we hold it.
@@ -148,12 +182,22 @@ func (l *Lock) Check() error {
 	}
 
 	// Check if it's us
-	if info.PID == os.Getpid() {
+	if heldByUs(info) {
 		return nil
 	}
 
 	// Locked by another process
 	return fmt.Errorf("%w: PID %d (session: %s)", ErrLocked, info.PID, info.SessionID)
+}
+
+// heldByUs reports whether the lock belongs to this process or to the agent
+// process this invocation runs under (locks are agent-anchored, so the PID in
+// the file is usually our tmux pane rather than our own PID).
+func heldByUs(info *LockInfo) bool {
+	if info.PID == os.Getpid() {
+		return true
+	}
+	return info.PID == ResolveAgentOwner("").PID
 }
 
 // Status returns a human-readable status of the lock.
@@ -170,7 +214,7 @@ func (l *Lock) Status() string {
 		return fmt.Sprintf("stale (dead PID %d)", info.PID)
 	}
 
-	if info.PID == os.Getpid() {
+	if heldByUs(info) {
 		return "locked (by us)"
 	}
 
@@ -184,7 +228,7 @@ func (l *Lock) ForceRelease() error {
 }
 
 // write creates or updates the lock file.
-func (l *Lock) write(sessionID string) error {
+func (l *Lock) write(owner Owner) error {
 	// Ensure .runtime directory exists
 	dir := filepath.Dir(l.lockPath)
 	if err := os.MkdirAll(dir, 0755); err != nil {
@@ -193,9 +237,11 @@ func (l *Lock) write(sessionID string) error {
 
 	hostname, _ := os.Hostname()
 	info := LockInfo{
-		PID:        os.Getpid(),
+		PID:        owner.PID,
 		AcquiredAt: time.Now(),
-		SessionID:  sessionID,
+		SessionID:  owner.SessionID,
+		PaneID:     owner.PaneID,
+		PIDSource:  owner.Source,
 		Hostname:   hostname,
 	}
 

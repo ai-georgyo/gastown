@@ -52,8 +52,14 @@ gt polecat check-recovery {{RIG}}/<name>
 ```
 
 Returns one of:
-- **SAFE_TO_NUKE**: cleanup_status is 'clean' — proceed with normal cleanup
-- **NEEDS_RECOVERY**: unpushed/uncommitted work exists
+- **SAFE_TO_NUKE**: cleanup_status is 'clean' AND the agent is gone — proceed with normal cleanup
+- **WORKING**: the polecat is mid-task — never nuke; unmerged work is at risk
+- **NEEDS_RECOVERY**: unpushed/uncommitted work exists, or the agent is still
+  alive, or its liveness could not be determined
+
+**Only SAFE_TO_NUKE authorizes cleanup.** Any other verdict — including one you
+do not recognize — means do not nuke. If the agent process is still running,
+stop the session first and re-run this check.
 
 ### If NEEDS_RECOVERY
 
@@ -79,7 +85,7 @@ Only use `--force` after Mayor authorizes or confirms work is unrecoverable.
 Before killing ANY polecat session:
 
 ```
-[ ] 1. gt polecat check-recovery {{RIG}}/<name>  # Must be SAFE_TO_NUKE
+[ ] 1. gt polecat check-recovery {{RIG}}/<name>  # Must be SAFE_TO_NUKE, nothing else
 [ ] 2. gt polecat git-state <name>               # Must be clean
 [ ] 3. bd show <issue-id>                        # Should show 'closed'
 [ ] 4. Check merge queue or PR status

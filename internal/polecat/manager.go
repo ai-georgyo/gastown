@@ -211,6 +211,13 @@ func (m *Manager) GetNamePool() *NamePool {
 	return m.namePool
 }
 
+// Tmux returns the manager's tmux client, or nil when none was configured.
+// Callers that probe agent liveness need it; nil means liveness is unobservable,
+// which is not the same as the agent being dead.
+func (m *Manager) Tmux() *tmux.Tmux {
+	return m.tmux
+}
+
 // lockPolecat acquires an exclusive file lock for a specific polecat.
 // This prevents concurrent gt processes from racing on the same polecat's
 // filesystem operations (Add, Remove, RepairWorktree).

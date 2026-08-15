@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,8 +13,10 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/git"
+	"github.com/steveyegge/gastown/internal/lock"
 	"github.com/steveyegge/gastown/internal/polecat"
 	"github.com/steveyegge/gastown/internal/rig"
+	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/util"
@@ -1144,7 +1147,14 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 		}
 		input.PartialSpawnWithoutDurableHook = partialSpawn
 		if blocker := cleanupStatusBlockerForRecovery(input.CleanupStatus, partialSpawn); blocker == "" && !input.CleanupStatus.IsSafe() {
-			input.IgnoreCleanupStatus = true
+			// Missing/unknown cleanup_status on a partial spawn may only be
+			// ignored against positive proof from git. Absence of a reported
+			// status is not evidence there is nothing to lose (gt-85p).
+			loadGitState()
+			if gitErr == nil && gitState != nil && gitState.Clean {
+				input.IgnoreCleanupStatus = true
+				status.Diagnostics = append(status.Diagnostics, fmt.Sprintf("ignored_missing_cleanup_status=%q direct_git_state=clean partial_spawn=true", input.CleanupStatus))
+			}
 		} else if blocker != "" {
 			if input.CleanupStatus == polecat.CleanupUnpushed {
 				loadGitState()
@@ -1162,6 +1172,18 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 	status.CleanupStatus = input.CleanupStatus
 	applyMQFactsToWorkstateInput(&input, &status, bd, workTerminal, p.ClonePath, targetRefs, targetRefLookupFailed, gitState, gitErr)
 	disposition := polecat.DecideWorkstate(input)
+
+	// SAFE_TO_NUKE authorizes destroying this sandbox, so it must rest on
+	// proof the agent is gone rather than on the bead state alone (gt-85p).
+	var livenessProbe agentLivenessProbe
+	if t := mgr.Tmux(); t != nil {
+		livenessProbe = t
+	}
+	live, livenessDiagnostic := polecatAgentLiveness(livenessProbe, rigName, polecatName, p.ClonePath)
+	if livenessDiagnostic != "" {
+		status.Diagnostics = append(status.Diagnostics, livenessDiagnostic)
+	}
+	disposition = polecat.ApplyLivenessFailSafe(disposition, live)
 	applyWorkstateDispositionToRecoveryStatus(&status, disposition)
 
 	if polecatCheckRecoveryReconcileCleanup {
@@ -1176,62 +1198,103 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 	}
 
 	// Human-readable output
-	fmt.Printf("%s\n\n", style.Bold.Render(fmt.Sprintf("Recovery Status: %s/%s", rigName, polecatName)))
-	fmt.Printf("  Cleanup Status:  %s\n", status.CleanupStatus)
+	renderRecoveryStatus(os.Stdout, rigName, polecatName, &status)
+
+	return nil
+}
+
+// renderRecoveryStatus writes the human-readable check-recovery report.
+//
+// This is the output the Witness cleanup checklist reads before nuking a
+// sandbox, so it must never claim safety the decision engine did not grant. It
+// renders SAFE_TO_NUKE only from status.SafeToNuke, and any verdict it does not
+// recognize is reported as-is and explicitly NOT safe. The previous version
+// switched on the verdict string with a `default:` arm that printed
+// "Safe to nuke - no work at risk", so a live WORKING polecat mid-task was
+// rendered as safe to destroy while its branch held unmerged commits (gt-85p).
+func renderRecoveryStatus(w io.Writer, rigName, polecatName string, status *RecoveryStatus) {
+	fmt.Fprintf(w, "%s\n\n", style.Bold.Render(fmt.Sprintf("Recovery Status: %s/%s", rigName, polecatName)))
+	cleanupStatus := string(status.CleanupStatus)
+	if cleanupStatus == "" {
+		// An empty field reads as "nothing wrong"; say what it means instead.
+		cleanupStatus = "unknown (not reported)"
+	}
+	fmt.Fprintf(w, "  Cleanup Status:  %s\n", cleanupStatus)
 	if status.Branch != "" {
-		fmt.Printf("  Branch:          %s\n", status.Branch)
+		fmt.Fprintf(w, "  Branch:          %s\n", status.Branch)
 	}
 	if status.Issue != "" {
-		fmt.Printf("  Issue:           %s\n", status.Issue)
+		fmt.Fprintf(w, "  Issue:           %s\n", status.Issue)
 	}
 	if status.ActiveMR != "" {
-		fmt.Printf("  Active MR:       %s\n", status.ActiveMR)
+		fmt.Fprintf(w, "  Active MR:       %s\n", status.ActiveMR)
 	}
 	if len(status.Diagnostics) > 0 {
-		fmt.Printf("  Diagnostics:     %s\n", strings.Join(status.Diagnostics, "; "))
+		fmt.Fprintf(w, "  Diagnostics:     %s\n", strings.Join(status.Diagnostics, "; "))
 	}
-	fmt.Println()
+	fmt.Fprintln(w)
+
+	if status.SafeToNuke && status.Verdict == polecat.WorkstateVerdictSafeToNuke {
+		fmt.Fprintf(w, "  Verdict:         %s\n", style.Success.Render(polecat.WorkstateVerdictSafeToNuke))
+		if status.MQStatus != "" {
+			fmt.Fprintf(w, "  MQ Status:       %s\n", status.MQStatus)
+		}
+		fmt.Fprintln(w)
+		fmt.Fprintf(w, "  %s Safe to nuke - no work at risk.\n", style.Success.Render("✓"))
+		return
+	}
 
 	switch status.Verdict {
 	case "NEEDS_MQ_SUBMIT":
-		fmt.Printf("  Verdict:         %s\n", style.Warning.Render("NEEDS_MQ_SUBMIT"))
-		fmt.Printf("  MQ Status:       %s\n", status.MQStatus)
-		fmt.Println()
-		fmt.Printf("  %s Work is pushed but was never submitted to the merge queue.\n", style.Warning.Render("⚠"))
-		fmt.Println("  Submit to MQ before cleanup, or the branch will be orphaned.")
+		fmt.Fprintf(w, "  Verdict:         %s\n", style.Warning.Render("NEEDS_MQ_SUBMIT"))
+		fmt.Fprintf(w, "  MQ Status:       %s\n", status.MQStatus)
+		fmt.Fprintln(w)
+		fmt.Fprintf(w, "  %s Work is pushed but was never submitted to the merge queue.\n", style.Warning.Render("⚠"))
+		fmt.Fprintln(w, "  Submit to MQ before cleanup, or the branch will be orphaned.")
 	case "PENDING_MR":
-		fmt.Printf("  Verdict:         %s\n", style.Warning.Render("PENDING_MR"))
-		fmt.Println()
-		fmt.Println("  Work is waiting on an active merge request; preserve this polecat until it lands.")
+		fmt.Fprintf(w, "  Verdict:         %s\n", style.Warning.Render("PENDING_MR"))
+		fmt.Fprintln(w)
+		fmt.Fprintln(w, "  Work is waiting on an active merge request; preserve this polecat until it lands.")
+	case polecat.WorkstateVerdictWorking:
+		fmt.Fprintf(w, "  Verdict:         %s\n", style.Warning.Render(polecat.WorkstateVerdictWorking))
+		fmt.Fprintln(w)
+		fmt.Fprintf(w, "  %s This polecat is working. Do NOT nuke - unmerged work is at risk.\n", style.Warning.Render("⚠"))
+		renderRecoveryBlockers(w, status)
 	case "NEEDS_RECOVERY":
-		fmt.Printf("  Verdict:         %s\n", style.Error.Render("NEEDS_RECOVERY"))
-		fmt.Println()
+		fmt.Fprintf(w, "  Verdict:         %s\n", style.Error.Render("NEEDS_RECOVERY"))
+		fmt.Fprintln(w)
 		if len(status.Blockers) > 0 {
-			fmt.Printf("  %s Cleanup refused by these predicate(s):\n", style.Warning.Render("⚠"))
-			for _, blocker := range status.Blockers {
-				fmt.Printf("    - %s\n", blocker)
-			}
-			if len(status.RecoveryActions) > 0 {
-				fmt.Println()
-				fmt.Println("  Recovery action(s):")
-				for _, action := range status.RecoveryActions {
-					fmt.Printf("    - %s\n", action)
-				}
-			}
+			fmt.Fprintf(w, "  %s Cleanup refused by these predicate(s):\n", style.Warning.Render("⚠"))
+			renderRecoveryBlockers(w, status)
 		} else {
-			fmt.Printf("  %s Cleanup refused by an unknown recovery predicate.\n", style.Warning.Render("⚠"))
+			fmt.Fprintf(w, "  %s Cleanup refused by an unknown recovery predicate.\n", style.Warning.Render("⚠"))
 		}
-		fmt.Println("  Escalate to Mayor for recovery before cleanup.")
+		fmt.Fprintln(w, "  Escalate to Mayor for recovery before cleanup.")
 	default:
-		fmt.Printf("  Verdict:         %s\n", style.Success.Render("SAFE_TO_NUKE"))
-		if status.MQStatus != "" {
-			fmt.Printf("  MQ Status:       %s\n", status.MQStatus)
+		// Unrecognized verdict: report it and refuse to imply safety.
+		verdict := status.Verdict
+		if verdict == "" {
+			verdict = "UNKNOWN"
 		}
-		fmt.Println()
-		fmt.Printf("  %s Safe to nuke - no work at risk.\n", style.Success.Render("✓"))
+		fmt.Fprintf(w, "  Verdict:         %s\n", style.Error.Render(verdict))
+		fmt.Fprintln(w)
+		fmt.Fprintf(w, "  %s Verdict not recognized as safe. Do NOT nuke.\n", style.Warning.Render("⚠"))
+		renderRecoveryBlockers(w, status)
+		fmt.Fprintln(w, "  Escalate to Mayor for recovery before cleanup.")
 	}
+}
 
-	return nil
+func renderRecoveryBlockers(w io.Writer, status *RecoveryStatus) {
+	for _, blocker := range status.Blockers {
+		fmt.Fprintf(w, "    - %s\n", blocker)
+	}
+	if len(status.RecoveryActions) > 0 {
+		fmt.Fprintln(w)
+		fmt.Fprintln(w, "  Recovery action(s):")
+		for _, action := range status.RecoveryActions {
+			fmt.Fprintf(w, "    - %s\n", action)
+		}
+	}
 }
 
 func applyGitStateToWorkstateInput(input *polecat.WorkstateInput, worktreePath string, gitState *GitState, gitErr error) {
@@ -1275,6 +1338,69 @@ func applyMQFactsToWorkstateInput(input *polecat.WorkstateInput, status *Recover
 		return
 	}
 	input.MRSubmitted = mr != nil
+}
+
+// agentLivenessProbe is the slice of tmux this check needs, isolated so the
+// liveness rules can be tested without a tmux server.
+type agentLivenessProbe interface {
+	IsAvailable() bool
+	HasSession(name string) (bool, error)
+	IsAgentAliveChecked(session string) (bool, error)
+}
+
+// polecatAgentLiveness observes whether a polecat's agent process is running.
+// Returns the observation plus a diagnostic string for facts worth reporting
+// that must not block (an unobservable environment is not evidence of death).
+//
+// Evidence rules, in the order they are trusted:
+//   - a live PID in the identity lock proves life (only a lock written by the
+//     agent's own process can say this; see lock.ResolveAgentOwner)
+//   - no tmux session proves death — the session is the agent's container
+//   - a failed tmux probe about a session that may exist is UNKNOWN, and unknown
+//     must not authorize destruction
+//   - no tmux at all is unobservable: reported as a diagnostic, not a blocker,
+//     so headless deployments keep working exactly as before
+func polecatAgentLiveness(t agentLivenessProbe, rigName, polecatName, clonePath string) (polecat.AgentLiveness, string) {
+	sessionName := session.PolecatSessionName(session.PrefixFor(rigName), polecatName)
+
+	if clonePath != "" {
+		if info, err := lock.New(clonePath).Read(); err == nil && info.OwnerAlive() {
+			return polecat.AgentLiveness{
+				Alive:  true,
+				Detail: fmt.Sprintf("agent_liveness=alive lock_pid=%d session=%s", info.PID, info.SessionID),
+			}, ""
+		}
+	}
+
+	if t == nil || !t.IsAvailable() {
+		return polecat.AgentLiveness{}, "agent_liveness=unobservable reason=tmux-unavailable"
+	}
+
+	running, err := t.HasSession(sessionName)
+	if err != nil {
+		return polecat.AgentLiveness{
+			Unknown: true,
+			Detail:  fmt.Sprintf("agent_liveness=unknown session=%s error=%v", sessionName, err),
+		}, ""
+	}
+	if !running {
+		return polecat.AgentLiveness{}, ""
+	}
+
+	alive, err := t.IsAgentAliveChecked(sessionName)
+	if err != nil {
+		return polecat.AgentLiveness{
+			Unknown: true,
+			Detail:  fmt.Sprintf("agent_liveness=unknown session=%s error=%v", sessionName, err),
+		}, ""
+	}
+	if alive {
+		return polecat.AgentLiveness{
+			Alive:  true,
+			Detail: fmt.Sprintf("agent_liveness=alive session=%s", sessionName),
+		}, ""
+	}
+	return polecat.AgentLiveness{}, fmt.Sprintf("agent_liveness=dead session=%s agent_process=gone", sessionName)
 }
 
 func applyWorkstateDispositionToRecoveryStatus(status *RecoveryStatus, disposition polecat.WorkstateDisposition) {
@@ -1452,6 +1578,14 @@ func recoveryGitStateBlocker(worktreePath string, gitState *GitState, gitErr err
 }
 
 func recoveryActionsForBlockers(blockers []string) []string {
+	for _, blocker := range blockers {
+		if strings.HasPrefix(blocker, "agent_liveness=alive") {
+			return []string{"the agent is still running - stop the session (gt polecat stop <rig>/<name>) and rerun check-recovery before any cleanup"}
+		}
+		if strings.HasPrefix(blocker, "agent_liveness=unknown") {
+			return []string{"agent liveness could not be determined - resolve the probe failure and rerun check-recovery; do not nuke on unknown state"}
+		}
+	}
 	for _, blocker := range blockers {
 		if strings.HasPrefix(blocker, "git_state=has_stash") {
 			return []string{"preserve branch-owned stash entries to auditable recovery refs before cleanup, then rerun check-recovery"}
