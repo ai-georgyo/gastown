@@ -13,19 +13,28 @@ var (
 	emitEventChannel string
 	emitEventType    string
 	emitEventPayload []string
+	emitEventRig     string
 )
 
 var moleculeEmitEventCmd = &cobra.Command{
 	Use:   "emit-event",
 	Short: "Emit a file-based event on a named channel",
-	Long: `Emit an event file to ~/gt/events/<channel>/ for subscribers to pick up.
+	Long: `Emit an event file to the channel directory for subscribers to pick up.
 
 This is the Go counterpart to emit-event.sh. Events are JSON files consumed
 by await-event subscribers (e.g., the refinery watching for MERGE_READY events).
 
+CHANNEL SCOPE:
+Rig-scoped channels (refinery, witness) have one directory per rig, so a
+submit on one rig never wakes another rig's agent:
+  ~/gt/events/rigs/<rig>/<channel>/
+The rig comes from --rig, else the working directory, else $GT_RIG.
+Town-level channels (mayor, deacon, custom names) stay town-global:
+  ~/gt/events/<channel>/
+
 EVENT FORMAT:
-Creates a JSON file at ~/gt/events/<channel>/<timestamp>.event:
-  {"type": "...", "channel": "...", "timestamp": "...", "payload": {...}}
+Creates a JSON file named <timestamp>.event in the channel directory:
+  {"type": "...", "channel": "...", "rig": "...", "timestamp": "...", "payload": {...}}
 
 EXAMPLES:
   # Emit a MERGE_READY event for the refinery
@@ -47,6 +56,7 @@ type EmitEventResult struct {
 	Path    string `json:"path"`
 	Channel string `json:"channel"`
 	Type    string `json:"type"`
+	Rig     string `json:"rig,omitempty"`
 }
 
 func init() {
@@ -56,6 +66,8 @@ func init() {
 		"Event type (required, e.g., 'MERGE_READY')")
 	moleculeEmitEventCmd.Flags().StringArrayVar(&emitEventPayload, "payload", nil,
 		"Payload key=value pairs (repeatable)")
+	moleculeEmitEventCmd.Flags().StringVar(&emitEventRig, "rig", "",
+		"Rig owning the channel (rig-scoped channels only; defaults to the rig of the working directory)")
 	moleculeEmitEventCmd.Flags().BoolVar(&moleculeJSON, "json", false,
 		"Output as JSON")
 	_ = moleculeEmitEventCmd.MarkFlagRequired("channel")
@@ -65,7 +77,13 @@ func init() {
 }
 
 func runMoleculeEmitEvent(cmd *cobra.Command, args []string) error {
-	path, err := channelevents.Emit(emitEventChannel, emitEventType, emitEventPayload)
+	townRoot := resolveEventTownRoot()
+	rigName, err := resolveEventRig(townRoot, emitEventRig, emitEventChannel)
+	if err != nil {
+		return err
+	}
+
+	path, err := channelevents.EmitToRig(townRoot, rigName, emitEventChannel, emitEventType, emitEventPayload)
 	if err != nil {
 		return err
 	}
@@ -77,6 +95,7 @@ func runMoleculeEmitEvent(cmd *cobra.Command, args []string) error {
 			Path:    path,
 			Channel: emitEventChannel,
 			Type:    emitEventType,
+			Rig:     rigName,
 		})
 	}
 

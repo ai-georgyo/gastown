@@ -31,6 +31,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   process (which outlives every CLI child), the real session name, the pane id
   in its own field, and a `pid_source` so readers can tell whether a dead PID is
   evidence of anything.
+- **Channel events are scoped per rig** (gt-em1) — `<town>/events/` held one
+  directory per channel for the whole town, so every rig's refinery woke for
+  every other rig's `MQ_SUBMIT`, scanned an empty queue, and burned a patrol
+  cycle. Worse, the channel is single-consumer: with `--cleanup`, whichever
+  refinery polled first deleted the event, so an MR notification could be
+  consumed by a rig it was never addressed to and never reach the right one.
+  Rig-scoped channels (`refinery`, `witness`) now live in
+  `<town>/events/rigs/<rig>/<channel>/`, giving each rig's agent a private,
+  single-consumer directory; town-level channels (`mayor`) are unchanged.
+  `gt mol step await-event` and `emit-event` take a `--rig` flag and otherwise
+  infer the rig from the working directory or `$GT_RIG`. The daemon's refinery
+  spawn gate is rig-scoped too, so one rig's pending event no longer starts
+  every other rig's refinery session.
 
 ## [1.2.1] - 2026-06-06
 

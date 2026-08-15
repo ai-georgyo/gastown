@@ -103,8 +103,15 @@ func TestEmitToResolvedTownIsBlockedUnderTest(t *testing.T) {
 		if _, err := channelevents.EmitToTown(townRoot, channel, "MQ_SUBMIT", []string{"source=sling"}); err == nil {
 			t.Errorf("EmitToTown(%q) succeeded under test; the event bus must be sandboxed", channel)
 		}
-		if _, err := channelevents.Emit(channel, "MQ_SUBMIT", []string{"source=sling"}); err == nil {
-			t.Errorf("Emit(%q) succeeded under test; the event bus must be sandboxed", channel)
+		// Per-rig channel directories are the same bus (gt-em1) and must be
+		// denied on the same terms as the town-level ones.
+		if _, err := channelevents.EmitToRig(townRoot, "somerig", channel, "MQ_SUBMIT", []string{"source=sling"}); err == nil {
+			t.Errorf("EmitToRig(%q) succeeded under test; the event bus must be sandboxed", channel)
+		}
+		// The town root resolved from the working directory, as
+		// "gt mol step emit-event" does.
+		if _, err := channelevents.EmitToTown(resolveEventTownRoot(), channel, "MQ_SUBMIT", []string{"source=sling"}); err == nil {
+			t.Errorf("emitting to the resolved town root (%q) succeeded under test; the event bus must be sandboxed", channel)
 		}
 	}
 

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/gofrs/flock"
+	"github.com/steveyegge/gastown/internal/channelevents"
 	"github.com/steveyegge/gastown/internal/tmux"
 )
 
@@ -160,7 +161,7 @@ func TestEnsureRefineryRunningSafetyStoppedDoesNotSpawn(t *testing.T) {
 	townRoot := t.TempDir()
 	writeDaemonTownFile(t, townRoot, "mayor/town.json", `{"name":"test"}`)
 	writeDaemonTownFile(t, townRoot, ".beads/metadata.json", `{"prefix":"hq"}`)
-	writeDaemonTownFile(t, townRoot, "events/refinery/pending.event", "{}")
+	writeDaemonTownFile(t, townRoot, "events/rigs/testrig/refinery/pending.event", "{}")
 	if err := os.MkdirAll(filepath.Join(townRoot, "testrig"), 0o755); err != nil {
 		t.Fatalf("mkdir rig: %v", err)
 	}
@@ -192,7 +193,7 @@ func TestEnsureRefineryRunningForkRigDoesNotSpawn(t *testing.T) {
 		t.Skip("mock tmux script uses POSIX shell")
 	}
 	townRoot := t.TempDir()
-	writeDaemonTownFile(t, townRoot, "events/refinery/pending.event", "{}")
+	writeDaemonTownFile(t, townRoot, "events/rigs/testrig/refinery/pending.event", "{}")
 	writeDaemonTownFile(t, townRoot, "testrig/config.json", `{"upstream_url":"https://github.com/upstream/repo","beads":{"prefix":"gt"}}`)
 
 	binDir := t.TempDir()
@@ -821,14 +822,14 @@ func TestIsRunningFromPID_LiveProcess(t *testing.T) {
 
 func TestHasPendingEvents_EmptyDir(t *testing.T) {
 	tmpDir := t.TempDir()
-	eventDir := filepath.Join(tmpDir, "events", "refinery")
+	eventDir := filepath.Join(tmpDir, "events", "rigs", "gastown", "refinery")
 	if err := os.MkdirAll(eventDir, 0755); err != nil {
 		t.Fatal(err)
 	}
 
 	d := &Daemon{config: &Config{TownRoot: tmpDir}}
 
-	if d.hasPendingEvents("refinery") {
+	if d.hasPendingEvents("gastown", "refinery") {
 		t.Error("expected false for empty event directory")
 	}
 }
@@ -838,14 +839,14 @@ func TestHasPendingEvents_MissingDir(t *testing.T) {
 
 	d := &Daemon{config: &Config{TownRoot: tmpDir}}
 
-	if d.hasPendingEvents("refinery") {
+	if d.hasPendingEvents("gastown", "refinery") {
 		t.Error("expected false when event directory doesn't exist")
 	}
 }
 
 func TestHasPendingEvents_WithEventFiles(t *testing.T) {
 	tmpDir := t.TempDir()
-	eventDir := filepath.Join(tmpDir, "events", "refinery")
+	eventDir := filepath.Join(tmpDir, "events", "rigs", "gastown", "refinery")
 	if err := os.MkdirAll(eventDir, 0755); err != nil {
 		t.Fatal(err)
 	}
@@ -858,14 +859,38 @@ func TestHasPendingEvents_WithEventFiles(t *testing.T) {
 
 	d := &Daemon{config: &Config{TownRoot: tmpDir}}
 
-	if !d.hasPendingEvents("refinery") {
+	if !d.hasPendingEvents("gastown", "refinery") {
 		t.Error("expected true when .event files exist")
+	}
+}
+
+// TestHasPendingEvents_OtherRigDoesNotCount is the daemon half of gt-em1: a
+// pending MQ_SUBMIT for one rig must not make the daemon spawn every other
+// rig's refinery session.
+func TestHasPendingEvents_OtherRigDoesNotCount(t *testing.T) {
+	tmpDir := t.TempDir()
+	channelevents.AllowEmitForTest(t, tmpDir)
+
+	if _, err := channelevents.EmitToRig(tmpDir, "gastown", "refinery", "MQ_SUBMIT", nil); err != nil {
+		t.Fatal(err)
+	}
+
+	d := &Daemon{config: &Config{TownRoot: tmpDir}}
+
+	if !d.hasPendingEvents("gastown", "refinery") {
+		t.Error("expected true for the rig the event was emitted to")
+	}
+	if d.hasPendingEvents("avalon", "refinery") {
+		t.Error("gastown's pending event must not count as avalon's")
+	}
+	if d.hasPendingEvents("", "refinery") {
+		t.Error("gastown's pending event must not appear in the town-level channel")
 	}
 }
 
 func TestHasPendingEvents_IgnoresNonEventFiles(t *testing.T) {
 	tmpDir := t.TempDir()
-	eventDir := filepath.Join(tmpDir, "events", "refinery")
+	eventDir := filepath.Join(tmpDir, "events", "rigs", "gastown", "refinery")
 	if err := os.MkdirAll(eventDir, 0755); err != nil {
 		t.Fatal(err)
 	}
@@ -877,7 +902,7 @@ func TestHasPendingEvents_IgnoresNonEventFiles(t *testing.T) {
 
 	d := &Daemon{config: &Config{TownRoot: tmpDir}}
 
-	if d.hasPendingEvents("refinery") {
+	if d.hasPendingEvents("gastown", "refinery") {
 		t.Error("expected false when only non-.event files exist")
 	}
 }

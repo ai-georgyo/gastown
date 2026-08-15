@@ -341,8 +341,9 @@ func handlePolecatDonePendingMR(bd *BdCli, workDir, rigName string, payload *Pol
 func notifyRefineryMergeReady(workDir, rigName string, result *HandlerResult) {
 	townRoot, _ := workspace.Find(workDir)
 	// Emit file-based event so refinery's await-event unblocks instantly.
+	// Scoped to the rig so other rigs' refineries are not woken (gt-em1).
 	if townRoot != "" {
-		_, _ = channelevents.EmitToTown(townRoot, "refinery", "MERGE_READY", []string{
+		_, _ = channelevents.EmitToRig(townRoot, rigName, "refinery", "MERGE_READY", []string{
 			"source=witness",
 			"rig=" + rigName,
 		})
