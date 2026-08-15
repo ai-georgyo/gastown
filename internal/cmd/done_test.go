@@ -937,11 +937,18 @@ func TestShouldUpdateAgentStateOnDone(t *testing.T) {
 func TestUpdateAgentStateAfterSubmissionSkipsFailedSubmissions(t *testing.T) {
 	calls := 0
 	old := updateAgentStateOnDoneFn
+	oldStuck := markAgentStuckAfterFailedSubmissionFn
 	updateAgentStateOnDoneFn = func(cwd, townRoot, exitType, issueID string) error {
 		calls++
 		return nil
 	}
-	t.Cleanup(func() { updateAgentStateOnDoneFn = old })
+	// Stubbed so the failure path doesn't touch a real agent bead; the stuck
+	// write itself is covered by TestUpdateAgentStateAfterSubmissionMarksStuckOnFailure.
+	markAgentStuckAfterFailedSubmissionFn = func(cwd, townRoot string) {}
+	t.Cleanup(func() {
+		updateAgentStateOnDoneFn = old
+		markAgentStuckAfterFailedSubmissionFn = oldStuck
+	})
 
 	if err := updateAgentStateAfterSubmission("/work", "/town", ExitCompleted, "gt-abc", true, false); err != nil {
 		t.Fatalf("updateAgentStateAfterSubmission push failure: %v", err)
@@ -2301,5 +2308,103 @@ func testRunGit(t *testing.T, dir string, args ...string) {
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("git %v in %s: %v\n%s", args, dir, err, out)
+	}
+}
+
+// TestNewCompletionMetadataRecordsRequestedExitType asserts criterion 1 of
+// gt-8yl: a `gt done --status DEFERRED` invocation writes exit_type=DEFERRED to
+// the agent bead. The assertion runs through the same serializer the real write
+// uses (FormatAgentDescription -> ParseAgentFields), so it fails if either the
+// metadata construction or the description round-trip drops or rewrites the
+// exit type.
+//
+// Background: gt-gastown-polecat-nux was read as evidence that DEFERRED wrote
+// COMPLETED. It was not — nux's LAST invocation was COMPLETED (done-intent label
+// and completion_time agree), and it overwrote a correct earlier DEFERRED. The
+// field is per-invocation, and this test pins that contract down.
+func TestNewCompletionMetadataRecordsRequestedExitType(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 8, 15, 12, 41, 13, 0, time.UTC)
+	for _, exitType := range []string{ExitDeferred, ExitEscalated, ExitCompleted} {
+		t.Run(exitType, func(t *testing.T) {
+			meta := newCompletionMetadata(exitType, "", "polecat/nux/gt-23p", "gt-23p", false, true, now)
+			if meta.ExitType != exitType {
+				t.Fatalf("meta.ExitType = %q, want %q", meta.ExitType, exitType)
+			}
+			if meta.CompletionTime != "2026-08-15T12:41:13Z" {
+				t.Fatalf("meta.CompletionTime = %q, want RFC3339 UTC", meta.CompletionTime)
+			}
+
+			// Round-trip through the agent-bead description exactly as
+			// UpdateAgentCompletion does.
+			fields := &beads.AgentFields{
+				RoleType:       "polecat",
+				Rig:            "gastown",
+				AgentState:     string(beads.AgentStateStuck),
+				ExitType:       meta.ExitType,
+				Branch:         meta.Branch,
+				PushFailed:     meta.PushFailed,
+				CompletionTime: meta.CompletionTime,
+			}
+			parsed := beads.ParseAgentFields(beads.FormatAgentDescription("gt-gastown-polecat-nux", fields))
+			if parsed == nil {
+				t.Fatal("ParseAgentFields returned nil")
+			}
+			if parsed.ExitType != exitType {
+				t.Errorf("persisted exit_type = %q, want %q", parsed.ExitType, exitType)
+			}
+			if !parsed.PushFailed {
+				t.Error("persisted push_failed = false, want true — the failure flag must survive alongside exit_type")
+			}
+		})
+	}
+}
+
+// TestUpdateAgentStateAfterSubmissionMarksStuckOnFailure verifies that a failed
+// push or MR submission still records agent_state, so exit_type and agent_state
+// describe the same invocation (gt-8yl). Before this, the whole state update was
+// skipped, leaving a stale agent_state from an earlier gt done next to the
+// exit_type this invocation had already written.
+func TestUpdateAgentStateAfterSubmissionMarksStuckOnFailure(t *testing.T) {
+	cleanupCalls := 0
+	stuckCalls := 0
+
+	oldUpdate := updateAgentStateOnDoneFn
+	oldStuck := markAgentStuckAfterFailedSubmissionFn
+	updateAgentStateOnDoneFn = func(cwd, townRoot, exitType, issueID string) error {
+		cleanupCalls++
+		return nil
+	}
+	markAgentStuckAfterFailedSubmissionFn = func(cwd, townRoot string) { stuckCalls++ }
+	t.Cleanup(func() {
+		updateAgentStateOnDoneFn = oldUpdate
+		markAgentStuckAfterFailedSubmissionFn = oldStuck
+	})
+
+	tests := []struct {
+		name             string
+		pushFailed       bool
+		mrFailed         bool
+		wantCleanupCalls int
+		wantStuckCalls   int
+	}{
+		{"push failure marks stuck without cleanup", true, false, 0, 1},
+		{"mr failure marks stuck without cleanup", false, true, 0, 2},
+		{"clean submission runs cleanup, not stuck", false, false, 1, 2},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := updateAgentStateAfterSubmission("/work", "/town", ExitCompleted, "gt-abc", tt.pushFailed, tt.mrFailed); err != nil {
+				t.Fatalf("updateAgentStateAfterSubmission: %v", err)
+			}
+			if cleanupCalls != tt.wantCleanupCalls {
+				t.Errorf("cleanup calls = %d, want %d", cleanupCalls, tt.wantCleanupCalls)
+			}
+			if stuckCalls != tt.wantStuckCalls {
+				t.Errorf("stuck calls = %d, want %d", stuckCalls, tt.wantStuckCalls)
+			}
+		})
 	}
 }

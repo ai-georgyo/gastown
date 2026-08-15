@@ -2356,6 +2356,7 @@ type CompletionDiscovery struct {
 	PolecatName    string
 	AgentBeadID    string
 	ExitType       string // COMPLETED, ESCALATED, DEFERRED, PHASE_COMPLETE
+	AgentState     string // agent_state observed alongside exit_type
 	IssueID        string // from hook_bead
 	MRID           string
 	Branch         string
@@ -2364,7 +2365,119 @@ type CompletionDiscovery struct {
 	CompletionTime string
 	Action         string // What was done: "merge-ready-sent", "acknowledged-idle", "phase-complete"
 	WispCreated    string // ID of cleanup wisp if created
+	// Uncorroborated is non-empty when a COMPLETED exit could not be
+	// corroborated, or when the completion is otherwise evidence worth keeping
+	// (a failed push). Its metadata is NOT cleared (gt-8yl).
+	Uncorroborated string
 	Error          error
+}
+
+// completionCorroboration is the evidence available about one discovered
+// completion. The fields differ in how much they can be trusted, which is the
+// whole point of collecting them together:
+//
+//   - ExitType is what a single gt done invocation was ASKED for. It is not an
+//     observation of the polecat, and a later invocation overwrites it.
+//   - PushFailed and MRFailed are written by the SAME invocation as ExitType, so
+//     they are internally consistent with it and say whether it succeeded.
+//   - AgentState may have been written by an EARLIER invocation: when a push or
+//     MR submission fails, gt done skips the cleanup that would rewrite it
+//     (gt-8yl). So it can dispute ExitType, but it cannot by itself establish
+//     anything — it may simply be stale.
+//   - MRQueued and IssueClosed are independent of the agent bead entirely. They
+//     are the only facts here that can positively confirm work landed.
+type completionCorroboration struct {
+	ExitType    string
+	AgentState  string
+	PushFailed  bool
+	MRFailed    bool
+	MRQueued    bool // An MR bead exists for this branch
+	IssueClosed bool // The source work bead reached a terminal status
+}
+
+// completionStateStalled reports whether an agent_state value describes a
+// polecat that did not get to a clean finish.
+func completionStateStalled(agentState string) bool {
+	state := strings.ToLower(strings.TrimSpace(agentState))
+	return state == string(beads.AgentStateStuck) || state == string(beads.AgentStateEscalated)
+}
+
+// uncorroboratedCompletionReason returns a human-readable reason when a
+// COMPLETED exit cannot be corroborated, and "" when it can be (or when there is
+// nothing to dispute).
+//
+// The asymmetry is deliberate and load-bearing. Routing a COMPLETED claim closes
+// the loop on a polecat AND clears the metadata, so a false COMPLETED destroys
+// both the work record and the evidence that anything went wrong. Routing a
+// DEFERRED claim only acknowledges an idle slot. So COMPLETED is the direction
+// that must earn its routing; the other exits are not second-guessed here.
+//
+// agent_state is deliberately NOT the discriminator (valkyrie falsified the
+// "agent_state always disagrees on a bad exit_type" claim, and gt-8yl showed
+// agent_state can itself be a stale leftover). It can only ever DISPUTE a
+// COMPLETED claim, never settle it. What settles it is independent evidence: a
+// queued MR or a closed source bead. Concretely:
+//
+//   - Independent evidence present -> route, whatever agent_state says. A stale
+//     agent_state must not strand work that demonstrably landed.
+//   - No independent evidence, and either this same invocation reported its MR
+//     failed or the polecat's own state disputes the claim -> decline. Not
+//     routed, and metadata preserved so the disagreement stays on the record.
+//   - No independent evidence and nothing disputing it -> route as before. An
+//     absent MR is normal for report-only and no-code completions.
+//
+// PushFailed is handled by processDiscoveredCompletion, which escalates it to
+// the mayor; it preserves its own metadata rather than declining here.
+func uncorroboratedCompletionReason(c completionCorroboration) string {
+	if strings.ToUpper(strings.TrimSpace(c.ExitType)) != string(ExitTypeCompleted) {
+		return ""
+	}
+	if c.PushFailed {
+		return "" // Routed and escalated by the push-failed path.
+	}
+	if c.MRQueued || c.IssueClosed {
+		return "" // Independent evidence confirms the claim.
+	}
+
+	switch {
+	case c.MRFailed:
+		return "exit_type=COMPLETED but the same gt done reported MR creation failed, and no MR is queued and the source bead is not closed"
+	case completionStateStalled(c.AgentState):
+		return fmt.Sprintf("exit_type=COMPLETED but agent_state=%s disputes it, and no MR is queued and the source bead is not closed",
+			strings.ToLower(strings.TrimSpace(c.AgentState)))
+	}
+	return ""
+}
+
+// gatherCompletionCorroboration fills in the independently checkable half of the
+// evidence. It only runs the extra bead lookups when something actually disputes
+// the completion — the common case costs nothing.
+func gatherCompletionCorroboration(bd *BdCli, workDir string, fields *beads.AgentFields, sourceIssue string) completionCorroboration {
+	c := completionCorroboration{
+		ExitType:   fields.ExitType,
+		AgentState: fields.AgentState,
+		PushFailed: fields.PushFailed,
+		MRFailed:   fields.MRFailed,
+	}
+
+	disputed := c.MRFailed || completionStateStalled(c.AgentState)
+	if !disputed || c.PushFailed || strings.ToUpper(strings.TrimSpace(c.ExitType)) != string(ExitTypeCompleted) {
+		return c
+	}
+
+	if fields.MRID != "" {
+		c.MRQueued = true
+	} else if fields.Branch != "" && findMRBeadForBranch(bd, workDir, fields.Branch) != "" {
+		c.MRQueued = true
+	}
+
+	if sourceIssue != "" {
+		if status, ok := getBeadStatus(bd, workDir, sourceIssue); ok {
+			c.IssueClosed = beads.IssueStatus(status).IsTerminal()
+		}
+	}
+
+	return c
 }
 
 // DiscoverCompletionsResult contains results from scanning agent beads for completions.
@@ -2431,12 +2544,28 @@ func DiscoverCompletions(bd *BdCli, workDir, rigName string, router *mail.Router
 			PolecatName:    polecatName,
 			AgentBeadID:    agentBeadID,
 			ExitType:       fields.ExitType,
+			AgentState:     fields.AgentState,
 			IssueID:        sourceIssue,
 			MRID:           fields.MRID,
 			Branch:         fields.Branch,
 			MRFailed:       fields.MRFailed,
 			PushFailed:     fields.PushFailed,
 			CompletionTime: fields.CompletionTime,
+		}
+
+		// Corroborate before routing (gt-8yl). exit_type is one agent's report of
+		// one invocation, not an observation of the polecat, so a COMPLETED claim
+		// that nothing independent supports and something on the record disputes
+		// is not acted on. Declining is idempotent: nothing is routed and the
+		// metadata is left in place, so the next patrol re-reports it until a
+		// human or the witness agent resolves it.
+		if reason := uncorroboratedCompletionReason(
+			gatherCompletionCorroboration(bd, workDir, fields, sourceIssue),
+		); reason != "" {
+			discovery.Uncorroborated = reason
+			discovery.Action = fmt.Sprintf("declined-uncorroborated (%s) — not routed, metadata preserved", reason)
+			result.Discovered = append(result.Discovered, discovery)
+			continue
 		}
 
 		// Build a payload compatible with the existing routing logic
@@ -2455,7 +2584,9 @@ func DiscoverCompletions(bd *BdCli, workDir, rigName string, router *mail.Router
 
 		// Clear completion metadata only after successful processing. If cleanup
 		// wisp creation/update failed, leave metadata for the next patrol retry.
-		if discovery.Error == nil {
+		// Evidence-bearing completions (an uncorroborated claim, a failed push)
+		// keep their metadata too — clearing it destroys the record (gt-8yl).
+		if discovery.Error == nil && discovery.Uncorroborated == "" {
 			if err := clearCompletionMetadata(bd, workDir, agentBeadID); err != nil {
 				result.Errors = append(result.Errors,
 					fmt.Errorf("clearing completion metadata for %s: %w", polecatName, err))
@@ -2483,6 +2614,10 @@ func processDiscoveredCompletion(bd *BdCli, workDir, rigName string, payload *Po
 	if payload.PushFailed {
 		discovery.Action = fmt.Sprintf("push-failed-recovery-needed (branch=%s issue=%s) — branch not on origin, worktree may be at risk",
 			payload.Branch, payload.IssueID)
+		// Keep the metadata: push_failed beside exit_type is the only durable
+		// record that this work never reached origin, and clearing it after one
+		// mayor nudge leaves nothing behind if the nudge is missed (gt-8yl).
+		discovery.Uncorroborated = "push failed — branch never reached origin"
 		// Notify mayor so a new polecat can be dispatched if work is lost.
 		townRoot, _ := workspace.Find(workDir)
 		if townRoot != "" {
