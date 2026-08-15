@@ -148,7 +148,7 @@ func runMoleculeAwaitSignal(cmd *cobra.Command, args []string) error {
 	var idleCycles int
 	var backoffUntil time.Time // zero value means no active window
 	if awaitSignalAgentBead != "" {
-		labels, err := getAgentLabels(awaitSignalAgentBead, beadsDir)
+		allLabels, resolvedDir, err := resolveAgentBeadLabels(awaitSignalAgentBead, beadsDir)
 		if err != nil {
 			// Agent bead might not exist yet - that's OK, start at 0
 			if !awaitSignalQuiet {
@@ -156,6 +156,9 @@ func runMoleculeAwaitSignal(cmd *cobra.Command, args []string) error {
 					style.Dim.Render("⚠"), err)
 			}
 		} else {
+			// Pin the state writes below to the database the state came from.
+			beadsDir = resolvedDir
+			labels := agentStateLabels(allLabels)
 			if idleStr, ok := labels["idle"]; ok {
 				if n, err := parseIntSimple(idleStr); err == nil {
 					idleCycles = n

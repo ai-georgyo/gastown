@@ -26,7 +26,11 @@ var agentsResolveCmd = &cobra.Command{
 
 The resolver searches the current rig database and the town database across
 both durable issues and ephemeral wisps. It prefers the current rig's wisp
-record, then rig issue, town wisp, and town issue. Closed beads are ignored.`,
+record, then rig issue, town wisp, and town issue. Closed beads are ignored.
+
+A town-level match is returned even when --rig is given: witness and refinery
+agent beads are provisioned only in the town database, and the agents that
+resolve them run from a rig worktree.`,
 	RunE: runAgentsResolve,
 }
 
@@ -108,9 +112,14 @@ func runAgentsResolve(cmd *cobra.Command, _ []string) error {
 		}
 		return fmt.Errorf("%s", message)
 	}
-	if rig != "" && agentBeadSourceIsTown(match.Source) && !agentsResolveJSON {
-		return fmt.Errorf("agent bead %s was found only in %s; patrol await/state commands require a rig-local agent bead", match.ID, match.Source)
-	}
+	// A town-only match is not an error. The only callers are the witness and
+	// refinery patrol formulas, which resolve their own agent bead and hand it
+	// to `gt mol step await-signal --agent-bead` / `gt agents state`; those run
+	// from the agent's rig worktree while every witness/refinery agent bead is
+	// provisioned in the town database, so rejecting town matches made the
+	// patrol await/state path unusable from the one cwd that uses it (hq-ej2).
+	// The state helpers fall back to the town database for the same reason, so
+	// the ID returned here is usable wherever it was found.
 
 	if agentsResolveJSON {
 		return json.NewEncoder(cmd.OutOrStdout()).Encode(agentsResolveResult{
@@ -271,8 +280,4 @@ func agentBeadSourceRank(source agentBeadSource) int {
 	default:
 		return 99
 	}
-}
-
-func agentBeadSourceIsTown(source agentBeadSource) bool {
-	return source == agentSourceTownWisps || source == agentSourceTownIssues
 }

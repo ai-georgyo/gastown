@@ -52,3 +52,46 @@ func resolveAgentTrackingBeadsDir() (string, error) {
 	}
 	return beadsDir, nil
 }
+
+// townAgentBeadsDir returns the town bead database for the current working
+// directory, or "" when the cwd is not inside a Gas Town workspace.
+func townAgentBeadsDir() string {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return ""
+	}
+	townRoot := beads.FindTownRoot(cwd)
+	if townRoot == "" {
+		return ""
+	}
+	return beads.ResolveBeadsDir(beads.GetTownBeadsPath(townRoot))
+}
+
+// resolveAgentBeadLabels reads all labels for an agent bead, preferring the
+// rig-local tracking database and falling back to the town database.
+//
+// Witness and refinery agent beads are provisioned only in the town database,
+// but those agents run from a rig worktree, so the cwd-local lookup misses and
+// backoff state becomes unreadable and unwritable from the only cwd that uses
+// it (hq-ej2). The returned beads dir is the database that answered, so
+// callers pin follow-up writes to the same place the state was read from.
+//
+// On failure the rig-local error is returned, since that lookup is the primary
+// one and its diagnostic names the database the caller expected.
+func resolveAgentBeadLabels(agentBead, preferredDir string) ([]string, string, error) {
+	labels, err := getAllAgentLabels(agentBead, preferredDir)
+	if err == nil {
+		return labels, preferredDir, nil
+	}
+
+	townDir := townAgentBeadsDir()
+	if townDir == "" || filepath.Clean(townDir) == filepath.Clean(preferredDir) {
+		return nil, preferredDir, err
+	}
+
+	townLabels, townErr := getAllAgentLabels(agentBead, townDir)
+	if townErr != nil {
+		return nil, preferredDir, err
+	}
+	return townLabels, townDir, nil
+}
