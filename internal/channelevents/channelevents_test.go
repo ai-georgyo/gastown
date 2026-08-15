@@ -11,6 +11,7 @@ import (
 func TestEmitToTown(t *testing.T) {
 	t.Parallel()
 	townRoot := t.TempDir()
+	AllowEmitForTest(t, townRoot)
 
 	path, err := EmitToTown(townRoot, "refinery", "MERGE_READY", []string{
 		"source=witness",
@@ -64,6 +65,7 @@ func TestEmitToTown_InvalidChannel(t *testing.T) {
 func TestEmitToTown_UniqueFilenames(t *testing.T) {
 	t.Parallel()
 	townRoot := t.TempDir()
+	AllowEmitForTest(t, townRoot)
 	seen := make(map[string]bool)
 
 	for i := 0; i < 10; i++ {
@@ -98,6 +100,7 @@ func TestValidChannelName(t *testing.T) {
 func TestEmitToTown_CreatesDirectory(t *testing.T) {
 	t.Parallel()
 	townRoot := t.TempDir()
+	AllowEmitForTest(t, townRoot)
 	channelDir := filepath.Join(townRoot, "events", "newchannel")
 
 	if _, err := os.Stat(channelDir); !os.IsNotExist(err) {

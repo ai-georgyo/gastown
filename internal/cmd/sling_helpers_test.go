@@ -107,7 +107,18 @@ func TestWakeRigAgentsDoesNotNudgeRefinery(t *testing.T) {
 // TestNudgeRefineryNoOpWithoutLog verifies that nudgeRefinery doesn't panic
 // or error when called without the test log env var and without a real tmux session.
 // The tmux NudgeSession call should fail silently.
+//
+// Clearing GT_TEST_NUDGE_LOG takes the real path, which also emits an MQ_SUBMIT
+// event to whatever town root the process resolves. tmux was sandboxed by the
+// rig not existing; the event bus was sandboxed by nothing, and because gt
+// clones sit inside the town they orchestrate, this test used to fire genuine
+// merge-queue submits into the live town on every run. The town root is now
+// pinned to a temp directory so the resolution cannot reach production, and
+// channelevents refuses the emission besides -- see
+// TestNudgeHelpersEmitNoEventsUnderTest for the assertion on the event bus.
 func TestNudgeRefineryNoOpWithoutLog(t *testing.T) {
+	newFakeTown(t)
+
 	// Ensure test log is NOT set so we exercise the real tmux path
 	t.Setenv("GT_TEST_NUDGE_LOG", "")
 

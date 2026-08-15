@@ -29,21 +29,12 @@ var emitSeq atomic.Uint64
 // Emit creates an event file in the channel directory, resolving the town
 // root from the current working directory.
 func Emit(channel, eventType string, payloadPairs []string) (string, error) {
-	if !ValidChannelName.MatchString(channel) {
-		return "", fmt.Errorf("invalid channel name %q: must match [a-zA-Z0-9_-]", channel)
-	}
-
 	townRoot, err := workspace.FindFromCwd()
 	if err != nil || townRoot == "" {
 		home, _ := os.UserHomeDir()
 		townRoot = filepath.Join(home, "gt")
 	}
-	eventDir := filepath.Join(townRoot, "events", channel)
-	if err := os.MkdirAll(eventDir, 0755); err != nil {
-		return "", fmt.Errorf("creating event directory: %w", err)
-	}
-
-	return emitToDir(eventDir, channel, eventType, payloadPairs)
+	return EmitToTown(townRoot, channel, eventType, payloadPairs)
 }
 
 // EmitToTown creates an event file using an explicit town root.
@@ -54,6 +45,11 @@ func EmitToTown(townRoot, channel, eventType string, payloadPairs []string) (str
 	}
 
 	eventDir := filepath.Join(townRoot, "events", channel)
+	// Checked before MkdirAll: creating the channel directory is itself a
+	// write to the town's event bus. See sandbox.go.
+	if err := checkEmitAllowed(eventDir); err != nil {
+		return "", err
+	}
 	if err := os.MkdirAll(eventDir, 0755); err != nil {
 		return "", fmt.Errorf("creating event directory: %w", err)
 	}
@@ -64,6 +60,11 @@ func EmitToTown(townRoot, channel, eventType string, payloadPairs []string) (str
 func emitToDir(eventDir, channel, eventType string, payloadPairs []string) (string, error) {
 	if !ValidChannelName.MatchString(channel) {
 		return "", fmt.Errorf("invalid channel name %q: must match [a-zA-Z0-9_-]", channel)
+	}
+	// Re-checked at the point of the write so the sandbox holds for any future
+	// caller that reaches emitToDir without going through EmitToTown.
+	if err := checkEmitAllowed(eventDir); err != nil {
+		return "", err
 	}
 
 	payload := make(map[string]string)

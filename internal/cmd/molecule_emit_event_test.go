@@ -13,6 +13,7 @@ import (
 func TestEmitEvent(t *testing.T) {
 	t.Run("basic event creation", func(t *testing.T) {
 		townRoot := t.TempDir()
+		channelevents.AllowEmitForTest(t, townRoot)
 
 		path, err := channelevents.EmitToTown(townRoot, "test-channel", "MERGE_READY", []string{"polecat=nux", "branch=feat/test"})
 		if err != nil {
@@ -56,6 +57,7 @@ func TestEmitEvent(t *testing.T) {
 
 	t.Run("empty payload", func(t *testing.T) {
 		townRoot := t.TempDir()
+		channelevents.AllowEmitForTest(t, townRoot)
 		path, err := channelevents.EmitToTown(townRoot, "test-channel", "PATROL_WAKE", nil)
 		if err != nil {
 			t.Fatalf("EmitEvent failed: %v", err)
@@ -85,6 +87,7 @@ func TestEmitEvent(t *testing.T) {
 
 	t.Run("multiple events unique paths", func(t *testing.T) {
 		townRoot := t.TempDir()
+		channelevents.AllowEmitForTest(t, townRoot)
 		paths := make(map[string]bool)
 		for i := 0; i < 5; i++ {
 			path, err := channelevents.EmitToTown(townRoot, "test-channel", "TEST", nil)
@@ -100,6 +103,7 @@ func TestEmitEvent(t *testing.T) {
 
 	t.Run("malformed payload pair ignored", func(t *testing.T) {
 		townRoot := t.TempDir()
+		channelevents.AllowEmitForTest(t, townRoot)
 		path, err := channelevents.EmitToTown(townRoot, "test-channel", "TEST", []string{"valid=yes", "no-equals-sign"})
 		if err != nil {
 			t.Fatalf("EmitEvent failed: %v", err)
@@ -125,6 +129,7 @@ func TestEmitEvent(t *testing.T) {
 
 func TestEmitEventChannelValidation(t *testing.T) {
 	townRoot := t.TempDir()
+	channelevents.AllowEmitForTest(t, townRoot)
 
 	// Valid channel name should succeed
 	_, err := channelevents.EmitToTown(townRoot, "valid-channel", "TEST", nil)
@@ -153,6 +158,7 @@ func TestEmitEventChannelValidation(t *testing.T) {
 
 func TestEmitEventPIDInFilename(t *testing.T) {
 	townRoot := t.TempDir()
+	channelevents.AllowEmitForTest(t, townRoot)
 	path, err := channelevents.EmitToTown(townRoot, "test-channel", "TEST", nil)
 	if err != nil {
 		t.Fatalf("emit failed: %v", err)

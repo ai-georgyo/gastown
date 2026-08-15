@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/channelevents"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/polecat"
 	"github.com/steveyegge/gastown/internal/tmux"
@@ -139,6 +140,9 @@ func setupSlotOpenTestTown(t *testing.T) (string, string) {
 	if err := os.MkdirAll(workDir, 0755); err != nil {
 		t.Fatal(err)
 	}
+	// This town is the test's own; the event bus is otherwise sandboxed shut
+	// under `go test`.
+	channelevents.AllowEmitForTest(t, townRoot)
 	return townRoot, workDir
 }
 
@@ -2706,6 +2710,7 @@ func TestNotifyRefineryMergeReady_EmitsChannelEvent(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "town.json"), []byte("{}"), 0644); err != nil {
 		t.Fatal(err)
 	}
+	channelevents.AllowEmitForTest(t, townRoot)
 
 	// Set GT_TEST_NUDGE_LOG to prevent actual tmux operations in nudgeRefinery
 	t.Setenv("GT_TEST_NUDGE_LOG", filepath.Join(t.TempDir(), "nudge.log"))
