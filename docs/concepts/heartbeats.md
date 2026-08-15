@@ -40,6 +40,10 @@ refreshed its session heartbeat while the file store aged past threshold).
 - **Gotcha:** a session that never reaches `await-signal` (handoff churn,
   session limits, one very long patrol turn) leaves this label stale for
   hours even though the agent is healthy.
+- **Gotcha:** the label refreshes once per wake, so its freshness is bounded by
+  the backoff interval, not by wall-clock activity. A witness passing `--rig`
+  (gt-qc1) no longer wakes on other rigs' traffic, so on a quiet rig this label
+  is refreshed at the backoff ceiling — up to 5 minutes — by design.
 
 ## Rules of thumb
 
