@@ -553,6 +553,51 @@ func doneReviewOnlyCloseSkipReasonForHead(bd *beads.Beads, issueID string, issue
 	return "", false
 }
 
+// sourceIssueTerminal reports whether the polecat's work bead has already
+// reached a terminal status (closed/tombstone). A polecat that closed its own
+// bead — the documented outcome for verify-only and no-op assignments
+// ("bd close --reason=no-changes: ...") — has declared the work finished, so
+// there is nothing left to merge and nothing left to lose.
+func sourceIssueTerminal(issue *beads.Issue) bool {
+	if issue == nil {
+		return false
+	}
+	return beads.IssueStatus(strings.TrimSpace(issue.Status)).IsTerminal()
+}
+
+// zeroCommitCloseTarget renders the bead id for the zero-commit guidance, or a
+// placeholder when gt done could not infer one.
+func zeroCommitCloseTarget(issueID string) string {
+	if id := strings.TrimSpace(issueID); id != "" {
+		return id
+	}
+	return "<your-bead-id>"
+}
+
+// allowZeroCommitCompletion reports whether a COMPLETED exit with zero commits
+// ahead of the base is legitimate.
+//
+// The zero-commit guard exists because polecats have been observed
+// sleepwalking through implementation without writing code (gastown#1484).
+// It must not, however, be the only outcome available to a polecat whose work
+// genuinely produced no commits: such a polecat cannot complete, so it never
+// retires its session and parks in "review-needed" forever with no terminal
+// path (gt-87i, town bead hq-w5e).
+//
+// Legitimate zero-commit completions:
+//   - non-polecats (crew/mayor) — never subject to the guard
+//   - --cleanup-status=clean — report-only tasks the formula directs there
+//   - no_merge/review_only beads — non-code work by design (GH#2496, gt-kvf)
+//   - an already-closed work bead — the polecat explicitly recorded that there
+//     was nothing to implement, which is auditable in the close reason
+//     (gt-87i; same rationale as the beadTerminal guard in applyMQCheck)
+func allowZeroCommitCompletion(isPolecat bool, cleanupStatus string, isNoMergeTask, sourceClosed bool) bool {
+	if !isPolecat {
+		return true
+	}
+	return cleanupStatus == "clean" || isNoMergeTask || sourceClosed
+}
+
 func loadDoneSourceIssue(bd *beads.Beads, issueID string, issue *beads.Issue) (*beads.Issue, string, bool) {
 	if issueID == "" {
 		return nil, "", false
@@ -1048,10 +1093,14 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		// The --cleanup-status=clean escape is preserved for legitimate report-only
 		// tasks (audits, reviews) that the formula explicitly directs to use it.
 		// no_merge/review_only tasks (GH#2496, gt-kvf) also bypass: non-code work has no commits by design.
+		// An already-closed work bead (gt-87i) also bypasses: the polecat has
+		// recorded that there was nothing to implement, and blocking here leaves
+		// it parked in review-needed with no terminal path.
 		// IMPORTANT: The error message must NOT mention --cleanup-status=clean.
 		// LLM agents read error messages and self-bypass (the original bug).
+		sourceClosed := sourceIssueTerminal(sourceIssueForNoMerge)
 		if aheadCount == 0 {
-			if os.Getenv("GT_POLECAT") != "" && doneCleanupStatus != "clean" && !isNoMergeTask {
+			if !allowZeroCommitCompletion(os.Getenv("GT_POLECAT") != "", doneCleanupStatus, isNoMergeTask, sourceClosed) {
 				// Before failing, check whether commits exist on the remote feature branch.
 				// After a polecat pushes to origin/<feature-branch> and submits an MR,
 				// if master advances (e.g., other MRs land), the feature branch is no
@@ -1063,21 +1112,35 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 					branchPushedWithWork = pushErr == nil && pushed && unpushed == 0
 				}
 				if !branchPushedWithWork {
+					// The DEFERRED/ESCALATED exits preserve the session for
+					// recovery — they are not terminal. A polecat whose work
+					// genuinely produced no commits must close its bead first,
+					// which is the auditable record that nothing was lost
+					// (gt-87i); gt done then completes without an MR.
 					return fmt.Errorf("cannot complete: no commits on branch ahead of %s\n"+
 						"Polecats must have at least 1 commit to submit.\n"+
-						"If the bug was already fixed upstream: gt done --status DEFERRED\n"+
+						"If there was genuinely nothing to implement (already fixed, cannot reproduce,\n"+
+						"not applicable): bd close %s --reason=\"no-changes: <why>\" then rerun gt done.\n"+
 						"If you're blocked: gt done --status ESCALATED",
-						baseRef)
+						baseRef, zeroCommitCloseTarget(issueID))
 				}
 			}
 
 			// Non-polecat (crew/mayor), polecat with --cleanup-status=clean
-			// (report-only tasks like audits/reviews), or no_merge polecat
-			// (non-code tasks like email/research per GH#2496):
-			// zero commits is valid.
+			// (report-only tasks like audits/reviews), no_merge polecat
+			// (non-code tasks like email/research per GH#2496), or a polecat
+			// whose bead is already closed (gt-87i): zero commits is valid.
 			fmt.Printf("%s Branch has no commits ahead of %s\n", style.Bold.Render("→"), baseRef)
 			fmt.Printf("  Work was likely already merged or report-only.\n")
 			fmt.Printf("  Skipping MR creation - completing without merge request.\n\n")
+
+			// gt-87i: the bead is already terminal, so there is nothing to close
+			// and no code to verify. Re-running the close path here would fail on
+			// the fork-mode and pushed-commit guards below and strand the polecat.
+			if sourceClosed {
+				fmt.Printf("%s Issue %s is already closed (%s)\n", style.Bold.Render("✓"), issueID, strings.TrimSpace(sourceIssueForNoMerge.Status))
+				goto notifyWitness
+			}
 
 			// G15 fix: Close the base issue when completing with no MR.
 			// Without this, no-op polecats (bug already fixed) leave issues stuck
