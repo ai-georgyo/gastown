@@ -144,7 +144,7 @@ func TestWaitForEventsFile_MissingFile(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
 
-	result, err := waitForEventsFile(ctx, filepath.Join(t.TempDir(), "nonexistent.jsonl"))
+	result, err := waitForEventsFile(ctx, filepath.Join(t.TempDir(), "nonexistent.jsonl"), nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -163,7 +163,7 @@ func TestWaitForEventsFile_Timeout(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
 
-	result, err := waitForEventsFile(ctx, eventsPath)
+	result, err := waitForEventsFile(ctx, eventsPath, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -194,7 +194,7 @@ func TestWaitForEventsFile_Signal(t *testing.T) {
 		_, _ = f.WriteString(`{"ts":"new","type":"sling","actor":"test"}` + "\n")
 	}()
 
-	result, err := waitForEventsFile(ctx, eventsPath)
+	result, err := waitForEventsFile(ctx, eventsPath, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -229,7 +229,7 @@ func TestWaitForActivitySignal_PathWiring(t *testing.T) {
 		_, _ = f.WriteString(`{"ts":"new","type":"sling"}` + "\n")
 	}()
 
-	result, err := waitForActivitySignal(ctx, townRoot)
+	result, err := waitForActivitySignal(ctx, townRoot, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

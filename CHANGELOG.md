@@ -44,6 +44,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   infer the rig from the working directory or `$GT_RIG`. The daemon's refinery
   spawn gate is rig-scoped too, so one rig's pending event no longer starts
   every other rig's refinery session.
+- **`gt mol step await-signal` can be scoped to a rig** (gt-qc1) — the sibling
+  of gt-em1 on the other wait primitive. The activity feed
+  (`<town>/.events.jsonl`) is town-wide, so a witness returned from its wait on
+  *any* rig's mail, sling or session churn. Measured in a seven-rig town, wake
+  latencies were 0.8s–17s against a 30–60s base timeout: the idle counter never
+  advanced, the exponential backoff never left its base interval, and the
+  abbreviated patrol mode that fires at `idle > 0` was unreachable — every wake
+  ran a full patrol, at a cost that scaled with *other* rigs' activity.
+  `await-signal` now takes `--rig <name>` and wakes only on events concerning
+  that rig; the witness patrol formula passes it. Matching is deliberately
+  asymmetric: any evidence the event is yours (actor, `to`, `target`, `agent`,
+  or an explicit `rig` in the payload) wakes you, only clear evidence of another
+  rig suppresses, and an event naming no rig at all — town halt, mass session
+  death — still wakes. Town-level agents keep the town-wide behavior by passing
+  no `--rig`; the deacon patrol continues to do so on purpose. Output and
+  `--json` report how many events were skipped. Also fixes a latent truncation
+  in the same tail loop: a line the writer had not finished flushing was read
+  and discarded rather than being carried to the next poll.
 
 ## [1.2.1] - 2026-06-06
 

@@ -25,6 +25,7 @@ var (
 	awaitSignalBackoffMax  string
 	awaitSignalQuiet       bool
 	awaitSignalAgentBead   string
+	awaitSignalRig         string
 )
 
 var moleculeAwaitSignalCmd = &cobra.Command{
@@ -41,6 +42,13 @@ but sets the AWAIT_SIGNAL_REASON environment variable to "timeout".
 
 The timeout can be specified directly or via backoff configuration for
 exponential wait patterns.
+
+RIG SCOPING:
+The activity feed is town-wide. Without --rig, ANY rig's activity wakes the
+caller, so in a busy town the idle counter never advances and backoff never
+engages. Pass --rig <name> to wake only on events that concern that rig.
+Events that name no rig at all (town halt, mass session death) always wake.
+Town-level agents such as the deacon should omit --rig.
 
 BACKOFF MODE:
 When backoff parameters are provided, the effective timeout is calculated as:
@@ -61,8 +69,8 @@ EXAMPLES:
   # Short form (alias)
   gt mol await-signal --timeout 60s
 
-  # Backoff mode with agent bead tracking:
-  gt mol await-signal --agent-bead gt-gastown-witness \
+  # Backoff mode with agent bead tracking, scoped to one rig:
+  gt mol await-signal --agent-bead gt-gastown-witness --rig gastown \
     --backoff-base 30s --backoff-mult 2 --backoff-max 15m
 
   # On timeout, the agent bead's idle:N label is auto-incremented
@@ -91,6 +99,8 @@ type AwaitSignalResult struct {
 	Signal      string        `json:"signal,omitempty"`      // the line that woke us (if signal)
 	IdleCycles  int           `json:"idle_cycles,omitempty"` // current idle cycle count (after update)
 	EffortLevel string        `json:"effort_level"`          // "full" or "abbreviated"
+	Rig         string        `json:"rig,omitempty"`         // rig the wait was scoped to ("" = town-wide)
+	Filtered    int           `json:"filtered,omitempty"`    // events skipped as belonging to another rig
 }
 
 func init() {
@@ -104,6 +114,8 @@ func init() {
 		"Maximum interval cap for backoff (e.g., 10m)")
 	moleculeAwaitSignalCmd.Flags().StringVar(&awaitSignalAgentBead, "agent-bead", "",
 		"Agent bead ID for tracking idle cycles (reads/writes idle:N label)")
+	moleculeAwaitSignalCmd.Flags().StringVar(&awaitSignalRig, "rig", "",
+		"Only wake on activity concerning this rig (default: any rig in the town)")
 	moleculeAwaitSignalCmd.Flags().BoolVar(&awaitSignalQuiet, "quiet", false,
 		"Suppress output (for scripting)")
 	moleculeAwaitSignalCmd.Flags().BoolVar(&moleculeJSON, "json", false,
@@ -122,6 +134,8 @@ func init() {
 		"Maximum interval cap for backoff (e.g., 10m)")
 	moleculeAwaitSignalShortcutCmd.Flags().StringVar(&awaitSignalAgentBead, "agent-bead", "",
 		"Agent bead ID for tracking idle cycles (reads/writes idle:N label)")
+	moleculeAwaitSignalShortcutCmd.Flags().StringVar(&awaitSignalRig, "rig", "",
+		"Only wake on activity concerning this rig (default: any rig in the town)")
 	moleculeAwaitSignalShortcutCmd.Flags().BoolVar(&awaitSignalQuiet, "quiet", false,
 		"Suppress output (for scripting)")
 	moleculeAwaitSignalShortcutCmd.Flags().BoolVar(&moleculeJSON, "json", false,
@@ -206,16 +220,21 @@ func runMoleculeAwaitSignal(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	scope := ""
+	if awaitSignalRig != "" {
+		scope = fmt.Sprintf(", rig: %s", awaitSignalRig)
+	}
+
 	if !awaitSignalQuiet && !moleculeJSON {
 		if resumed {
-			fmt.Printf("%s Resuming backoff (remaining: %v, idle: %d)...\n",
-				style.Dim.Render("⏳"), timeout.Round(time.Second), idleCycles)
+			fmt.Printf("%s Resuming backoff (remaining: %v, idle: %d%s)...\n",
+				style.Dim.Render("⏳"), timeout.Round(time.Second), idleCycles, scope)
 		} else if awaitSignalAgentBead != "" {
-			fmt.Printf("%s Awaiting signal (timeout: %v, idle: %d)...\n",
-				style.Dim.Render("⏳"), timeout, idleCycles)
+			fmt.Printf("%s Awaiting signal (timeout: %v, idle: %d%s)...\n",
+				style.Dim.Render("⏳"), timeout, idleCycles, scope)
 		} else {
-			fmt.Printf("%s Awaiting signal (timeout: %v)...\n",
-				style.Dim.Render("⏳"), timeout)
+			fmt.Printf("%s Awaiting signal (timeout: %v%s)...\n",
+				style.Dim.Render("⏳"), timeout, scope)
 		}
 	}
 
@@ -225,12 +244,13 @@ func runMoleculeAwaitSignal(cmd *cobra.Command, args []string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	result, err := waitForActivitySignal(ctx, townRoot)
+	result, err := waitForActivitySignal(ctx, townRoot, newRigScopeMatcher(townRoot, awaitSignalRig))
 	if err != nil {
 		return fmt.Errorf("feed subscription failed: %w", err)
 	}
 
 	result.Elapsed = time.Since(startTime)
+	result.Rig = awaitSignalRig
 
 	// On timeout, increment idle cycles and clear backoff window
 	if result.Reason == "timeout" && awaitSignalAgentBead != "" {
@@ -305,6 +325,11 @@ func runMoleculeAwaitSignal(cmd *cobra.Command, args []string) error {
 			}
 		}
 
+		if result.Filtered > 0 {
+			fmt.Printf("  %s\n", style.Dim.Render(fmt.Sprintf(
+				"skipped %d event(s) belonging to other rigs", result.Filtered)))
+		}
+
 		// Output effort recommendation for the next patrol cycle.
 		if result.EffortLevel == "abbreviated" {
 			fmt.Printf("\n%s Run ABBREVIATED patrol: quick checks only, skip optional steps.\n",
@@ -366,13 +391,16 @@ func calculateEffectiveTimeout(idleCycles int) (time.Duration, error) {
 // townRoot is the Gas Town workspace root; the events file is at
 // <townRoot>/.events.jsonl. Returns immediately when a new event line is
 // appended, or when context is canceled.
-func waitForActivitySignal(ctx context.Context, townRoot string) (*AwaitSignalResult, error) {
-	return waitForEventsFile(ctx, filepath.Join(townRoot, events.EventsFile))
+//
+// matcher, when non-nil, restricts the wake to events concerning one rig; a nil
+// matcher wakes on any town activity.
+func waitForActivitySignal(ctx context.Context, townRoot string, matcher *rigScopeMatcher) (*AwaitSignalResult, error) {
+	return waitForEventsFile(ctx, filepath.Join(townRoot, events.EventsFile), matcher)
 }
 
 // waitForEventsFile tails the events file for new lines.
 // This replaces the former bd activity --follow subprocess approach.
-func waitForEventsFile(ctx context.Context, eventsPath string) (*AwaitSignalResult, error) {
+func waitForEventsFile(ctx context.Context, eventsPath string, matcher *rigScopeMatcher) (*AwaitSignalResult, error) {
 
 	f, err := os.OpenFile(eventsPath, os.O_RDONLY|os.O_CREATE, 0644)
 	if err != nil {
@@ -392,23 +420,51 @@ func waitForEventsFile(ctx context.Context, eventsPath string) (*AwaitSignalResu
 	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
 
+	// A tick may find several appended lines, and with a rig scope most of
+	// them can be another rig's. Drain everything available each tick rather
+	// than paying 200ms per skipped event.
+	//
+	// pending holds a line the writer has not finished flushing: ReadString
+	// consumes a partial line along with io.EOF, so it must be carried to the
+	// next read or the event is lost (and, once filtering, misparsed).
+	var pending strings.Builder
+	filtered := 0
+
 	for {
 		select {
 		case <-ctx.Done():
 			return &AwaitSignalResult{
-				Reason: "timeout",
+				Reason:   "timeout",
+				Filtered: filtered,
 			}, nil
 		case <-ticker.C:
-			line, err := reader.ReadString('\n')
-			if err == nil && line != "" {
+			for {
+				chunk, err := reader.ReadString('\n')
+				if chunk != "" {
+					pending.WriteString(chunk)
+				}
+				if err != nil {
+					// io.EOF means no complete line yet — keep polling
+					if err == io.EOF {
+						break
+					}
+					return nil, fmt.Errorf("reading events file: %w", err)
+				}
+
+				line := strings.TrimRight(pending.String(), "\r\n")
+				pending.Reset()
+				if line == "" {
+					continue
+				}
+				if !matcher.matches(line) {
+					filtered++
+					continue
+				}
 				return &AwaitSignalResult{
-					Reason: "signal",
-					Signal: strings.TrimRight(line, "\n"),
+					Reason:   "signal",
+					Signal:   line,
+					Filtered: filtered,
 				}, nil
-			}
-			// io.EOF means no new data yet — keep polling
-			if err != nil && err != io.EOF {
-				return nil, fmt.Errorf("reading events file: %w", err)
 			}
 		}
 	}

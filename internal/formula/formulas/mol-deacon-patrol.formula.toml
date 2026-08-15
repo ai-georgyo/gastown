@@ -72,7 +72,7 @@ When `await-signal` outputs `EFFORT: full`, run all steps thoroughly (normal mod
 
 The goal: idle cycles should burn ~10% of the tokens a full patrol uses."""
 formula = "mol-deacon-patrol"
-version = 14
+version = 15
 
 [vars]
 [vars.wisp_type]
@@ -1201,9 +1201,13 @@ gt mol step await-signal --agent-bead hq-deacon \
   --backoff-base 60s --backoff-mult 2 --backoff-max 15m
 ```
 
+No `--rig` here, deliberately: the deacon is a town-level agent and wants the
+whole town's activity. Rig agents (the witness) pass `--rig` so that other rigs'
+traffic does not wake them — see gt-qc1.
+
 This command:
-1. Subscribes to `bd activity --follow` (beads activity feed)
-2. Returns IMMEDIATELY when any beads activity occurs
+1. Tails the town activity feed (`<town>/.events.jsonl`)
+2. Returns IMMEDIATELY when any town activity occurs
 3. If no activity, times out with exponential backoff:
    - First timeout: 60s
    - Second timeout: 120s
