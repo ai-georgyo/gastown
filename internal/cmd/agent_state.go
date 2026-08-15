@@ -99,6 +99,16 @@ func runAgentState(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("not in a beads workspace: %w", err)
 	}
 
+	// Read once, up front: it tells us both the current state and which
+	// database holds this agent bead (town-level beads are not in the
+	// rig-local database that the cwd resolves to).
+	allLabels, resolvedDir, err := resolveAgentBeadLabels(agentBead, beadsDir)
+	if err != nil {
+		return err
+	}
+	beadsDir = resolvedDir
+	labels := agentStateLabels(allLabels)
+
 	// Determine operation mode
 	hasSet := len(agentStateSet) > 0
 	hasIncr := agentStateIncr != ""
@@ -106,20 +116,15 @@ func runAgentState(cmd *cobra.Command, args []string) error {
 
 	if hasSet || hasIncr || hasDel {
 		// Modification mode
-		return modifyAgentState(agentBead, beadsDir, hasIncr)
+		return modifyAgentState(agentBead, beadsDir, hasIncr, labels, allLabels)
 	}
 
 	// Query mode
-	return queryAgentState(agentBead, beadsDir)
+	return queryAgentState(agentBead, labels)
 }
 
-// queryAgentState retrieves and displays labels from an agent bead.
-func queryAgentState(agentBead, beadsDir string) error {
-	labels, err := getAgentLabels(agentBead, beadsDir)
-	if err != nil {
-		return err
-	}
-
+// queryAgentState displays state labels read from an agent bead.
+func queryAgentState(agentBead string, labels map[string]string) error {
 	result := &agentStateResult{
 		AgentBead: agentBead,
 		Labels:    labels,
@@ -147,20 +152,10 @@ func queryAgentState(agentBead, beadsDir string) error {
 }
 
 // modifyAgentState modifies labels on an agent bead.
-// Uses read-modify-write pattern: read current labels, apply changes, write back all.
-func modifyAgentState(agentBead, beadsDir string, hasIncr bool) error {
-	// Read current labels
-	labels, err := getAgentLabels(agentBead, beadsDir)
-	if err != nil {
-		return err
-	}
-
-	// Also get non-state labels (ones without : separator) to preserve them
-	allLabels, err := getAllAgentLabels(agentBead, beadsDir)
-	if err != nil {
-		return err
-	}
-
+// Uses read-modify-write pattern: the caller supplies the current state labels
+// and the full label set (non-state labels are preserved on write-back), and
+// beadsDir must be the database those labels were read from.
+func modifyAgentState(agentBead, beadsDir string, hasIncr bool, labels map[string]string, allLabels []string) error {
 	// Apply increment operation
 	if hasIncr {
 		currentValue := 0
@@ -241,8 +236,12 @@ func getAgentLabels(agentBead, beadsDir string) (map[string]string, error) {
 	if err != nil {
 		return nil, err
 	}
+	return agentStateLabels(allLabels), nil
+}
 
-	// Parse state labels (those with : separator) into key:value map
+// agentStateLabels parses state labels (those with a : separator) from a full
+// label list into a key/value map.
+func agentStateLabels(allLabels []string) map[string]string {
 	labels := make(map[string]string)
 	for _, label := range allLabels {
 		parts := strings.SplitN(label, ":", 2)
@@ -250,8 +249,7 @@ func getAgentLabels(agentBead, beadsDir string) (map[string]string, error) {
 			labels[parts[0]] = parts[1]
 		}
 	}
-
-	return labels, nil
+	return labels
 }
 
 // bdCallTimeout is the per-call timeout for bd subprocess invocations in agent-bead

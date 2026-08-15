@@ -162,13 +162,16 @@ func runMoleculeAwaitEvent(cmd *cobra.Command, args []string) error {
 		var wdErr error
 		beadsDir, wdErr = resolveAgentTrackingBeadsDir()
 		if wdErr == nil {
-			labels, labErr := getAgentLabels(awaitEventAgentBead, beadsDir)
+			allLabels, resolvedDir, labErr := resolveAgentBeadLabels(awaitEventAgentBead, beadsDir)
 			if labErr != nil {
 				if !awaitEventQuiet {
 					fmt.Printf("%s Could not read agent bead (starting at idle=0): %v\n",
 						style.Dim.Render("⚠"), labErr)
 				}
 			} else {
+				// Pin the state writes below to the database the state came from.
+				beadsDir = resolvedDir
+				labels := agentStateLabels(allLabels)
 				if idleStr, ok := labels["idle"]; ok {
 					if n, parseErr := parseIntSimple(idleStr); parseErr == nil {
 						idleCycles = n
