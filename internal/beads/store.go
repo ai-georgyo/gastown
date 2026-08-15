@@ -274,6 +274,15 @@ func workFilterFromListOpts(opts ListOptions) beadsdk.WorkFilter {
 
 // storeList implements List using the in-process store.
 func (b *Beads) storeList(opts ListOptions) ([]*Issue, error) {
+	// Match legacy trailing-slash rows for town-level agents; the SDK filter
+	// holds a single assignee, so query each variant and merge.
+	if variants := AssigneeQueryVariants(opts.Assignee); len(variants) > 1 {
+		return b.listAcrossAssigneeVariants(opts, variants, b.storeListForAssignee)
+	}
+	return b.storeListForAssignee(opts)
+}
+
+func (b *Beads) storeListForAssignee(opts ListOptions) ([]*Issue, error) {
 	ctx, cancel := storeCtx()
 	defer cancel()
 

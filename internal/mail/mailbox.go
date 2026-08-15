@@ -31,6 +31,45 @@ var (
 	ErrEmptyInbox      = errors.New("inbox is empty")
 )
 
+// NotOwnerError reports that bd refused to close a message because the stored
+// assignee does not name the identity this process is acting as (BD_ACTOR).
+//
+// bd phrases its own refusal as:
+//
+//	cannot close hq-x: assignee is "deacon/", actor is "deacon"; reclaim or use --force to override
+//
+// The --force it names is a bd flag. Surfacing that text verbatim from
+// gt mail archive sent readers to a flag gt does not have (hq-516), so the
+// facts are kept and the suggestion is dropped — callers attach a remedy that
+// actually exists for the command being run.
+type NotOwnerError struct {
+	ID       string
+	Assignee string
+	Actor    string
+}
+
+func (e *NotOwnerError) Error() string {
+	return fmt.Sprintf("message %s is assigned to %q but this session acts as %q",
+		e.ID, e.Assignee, e.Actor)
+}
+
+// bdOwnershipPattern matches the assignee/actor pair in bd's ownership refusal.
+var bdOwnershipPattern = regexp.MustCompile(`assignee is "([^"]*)", actor is "([^"]*)"`)
+
+// asNotOwnerError converts a bd ownership refusal into a NotOwnerError.
+// Any other error is returned unchanged.
+func asNotOwnerError(id string, err error) error {
+	bdErr, ok := err.(*bdError)
+	if !ok {
+		return err
+	}
+	match := bdOwnershipPattern.FindStringSubmatch(bdErr.Stderr)
+	if match == nil {
+		return err
+	}
+	return &NotOwnerError{ID: id, Assignee: match[1], Actor: match[2]}
+}
+
 // Mailbox manages messages for an identity via beads.
 // When store is non-nil, beads-mode methods use the in-process beadsdk.Storage
 // directly instead of shelling out to the bd CLI.
@@ -614,7 +653,7 @@ func (m *Mailbox) closeInDir(id, beadsDir string) error {
 		if isBdNotFound(err) {
 			return ErrMessageNotFound
 		}
-		return err
+		return asNotOwnerError(id, err)
 	}
 
 	return nil

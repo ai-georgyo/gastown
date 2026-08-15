@@ -1450,7 +1450,7 @@ func hookBeadForHandoff(beadID string) error {
 	}
 
 	// Pin the bead using bd update (discovery-based approach)
-	pinCmd := exec.Command("bd", "update", beadID, "--status=pinned", "--assignee="+agentID)
+	pinCmd := exec.Command("bd", beads.NormalizeAssigneeArgs([]string{"update", beadID, "--status=pinned", "--assignee=" + agentID})...)
 	pinCmd.Stderr = os.Stderr
 	if err := pinCmd.Run(); err != nil {
 		return fmt.Errorf("pinning bead: %w", err)

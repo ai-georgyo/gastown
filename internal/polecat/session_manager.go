@@ -960,7 +960,7 @@ func (m *SessionManager) hookIssue(issueID, agentID, workDir string) error {
 
 	ctx, cancel := context.WithTimeout(context.Background(), constants.BdCommandTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "bd", "update", issueID, "--status=hooked", "--assignee="+agentID) //nolint:gosec // G204: bd is a trusted internal tool
+	cmd := exec.CommandContext(ctx, "bd", beads.NormalizeAssigneeArgs([]string{"update", issueID, "--status=hooked", "--assignee=" + agentID})...) //nolint:gosec // G204: bd is a trusted internal tool
 	util.SetDetachedProcessGroup(cmd)
 	cmd.Dir = bdWorkDir
 	cmd.Stderr = os.Stderr

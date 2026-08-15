@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/workspace"
@@ -56,19 +57,12 @@ func sessionToAgentID(sessionName string) string {
 }
 
 // canonicalAssigneeAddress returns the address used for bead assignees and
-// hook-status queries. This matches the form emitted by resolveSelfTarget and
-// buildAgentIdentity: town-level agents (mayor, deacon) get a trailing slash.
-// session.AgentIdentity.Address() returns the bare name for those roles, which
-// causes the read/write mismatch in GH#3699.
+// hook-status queries. session.AgentIdentity.Address() already emits the
+// canonical bare form for town-level agents; CanonicalAssignee guards against
+// a slashed value arriving from anywhere else.
+// See internal/beads/agent_address.go for why bare is canonical (GH#3699).
 func canonicalAssigneeAddress(identity *session.AgentIdentity) string {
-	addr := identity.Address()
-	switch identity.Role {
-	case session.RoleMayor, session.RoleDeacon:
-		if !strings.HasSuffix(addr, "/") {
-			return addr + "/"
-		}
-	}
-	return addr
+	return beads.CanonicalAssignee(identity.Address())
 }
 
 // resolveSelfTarget determines agent identity, pane, and hook root for slinging to self.
@@ -78,26 +72,11 @@ func resolveSelfTarget() (agentID string, pane string, hookRoot string, err erro
 		return "", "", "", fmt.Errorf("detecting role: %w", err)
 	}
 
-	// Build agent identity from role
-	// Town-level agents use trailing slash to match addressToIdentity() normalization
-	switch roleInfo.Role {
-	case RoleMayor:
-		agentID = "mayor/"
-	case RoleDeacon:
-		agentID = "deacon/"
-	case RoleBoot:
-		agentID = "deacon/boot"
-	case RoleWitness:
-		agentID = fmt.Sprintf("%s/witness", roleInfo.Rig)
-	case RoleRefinery:
-		agentID = fmt.Sprintf("%s/refinery", roleInfo.Rig)
-	case RolePolecat:
-		agentID = fmt.Sprintf("%s/polecats/%s", roleInfo.Rig, roleInfo.Polecat)
-	case RoleCrew:
-		agentID = fmt.Sprintf("%s/crew/%s", roleInfo.Rig, roleInfo.Polecat)
-	case RoleDog:
-		agentID = fmt.Sprintf("deacon/dogs/%s", roleInfo.Polecat)
-	default:
+	// buildAgentIdentity is the single producer of assignee identity — reusing
+	// it here is what keeps writers (gt sling, gt patrol report) and readers
+	// (gt hook) on the same spelling.
+	agentID = buildAgentIdentity(roleInfo)
+	if agentID == "" {
 		return "", "", "", fmt.Errorf("cannot determine agent identity (role: %s)", roleInfo.Role)
 	}
 

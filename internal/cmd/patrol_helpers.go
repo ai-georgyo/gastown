@@ -30,6 +30,47 @@ type PatrolConfig struct {
 	Beads         *beads.Beads // optional injected beads instance (for test isolation)
 }
 
+// patrolConfigForRole builds the patrol config for a role.
+//
+// This is the single place patrol work is stamped with an owner. It takes the
+// assignee from buildAgentIdentity — the same producer gt hook reads through —
+// so the wisp gt patrol report arms can never be addressed in a spelling the
+// next session's hook query will not match (hq-j5v defect 1).
+//
+// role is passed separately from roleInfo so gt patrol new can honor its
+// --role override; pass roleInfo.Role when there is none.
+func patrolConfigForRole(role Role, roleInfo RoleInfo) (PatrolConfig, error) {
+	identityCtx := roleInfo
+	identityCtx.Role = role
+
+	switch role {
+	case RoleDeacon:
+		return PatrolConfig{
+			RoleName:      "deacon",
+			PatrolMolName: constants.MolDeaconPatrol,
+			BeadsDir:      roleInfo.TownRoot,
+			Assignee:      buildAgentIdentity(identityCtx),
+		}, nil
+	case RoleWitness:
+		return PatrolConfig{
+			RoleName:      "witness",
+			PatrolMolName: constants.MolWitnessPatrol,
+			BeadsDir:      roleInfo.TownRoot,
+			Assignee:      buildAgentIdentity(identityCtx),
+		}, nil
+	case RoleRefinery:
+		return PatrolConfig{
+			RoleName:      "refinery",
+			PatrolMolName: constants.MolRefineryPatrol,
+			BeadsDir:      roleInfo.TownRoot,
+			Assignee:      buildAgentIdentity(identityCtx),
+			ExtraVars:     buildRefineryPatrolVars(roleInfo),
+		}, nil
+	default:
+		return PatrolConfig{}, fmt.Errorf("unsupported role for patrol: %q (expected deacon, witness, or refinery)", string(role))
+	}
+}
+
 // maxStalePurgePerRun caps the number of stale patrol beads cleaned up in a
 // single findActivePatrol call. Without a cap, N accumulated orphans produce
 // N×K sequential Dolt queries (K = closeDescendants depth), overwhelming the

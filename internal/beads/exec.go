@@ -41,6 +41,12 @@ func CommandContext(ctx context.Context, dir, fallbackBeadsDir string, mode Subp
 func ConfigureCommand(cmd *exec.Cmd, dir, fallbackBeadsDir string, mode SubprocessEnvMode) {
 	cmd.Dir = dir
 	cmd.Env = EnvForSubprocessMode(os.Environ(), fallbackBeadsDir, mode)
+	// Canonicalize agent identity on the way to bd's assignee column. See
+	// agent_address.go — cmd.Args[0] is the binary name, so only the flags
+	// after it are rewritten.
+	if len(cmd.Args) > 1 {
+		cmd.Args = append(cmd.Args[:1], NormalizeAssigneeArgs(cmd.Args[1:])...)
+	}
 	util.SetDetachedProcessGroup(cmd)
 }
 

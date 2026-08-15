@@ -776,6 +776,11 @@ func (b *Beads) runWithStdin(stdinData []byte, args ...string) (_ []byte, retErr
 	// (which changes args[0] from "list" to "--allow-stale").
 	args = InjectFlatForListJSON(args)
 
+	// Canonicalize agent identity before it reaches bd's assignee column so a
+	// caller that hand-builds "deacon/" cannot write a record its own agent
+	// can neither find nor own. See agent_address.go.
+	args = NormalizeAssigneeArgs(args)
+
 	// Conditionally use --allow-stale to prevent failures when db is temporarily stale
 	// (e.g., after daemon is killed during shutdown). Only if bd supports it.
 	beadsDir := b.getResolvedBeadsDir()
@@ -856,6 +861,7 @@ func (b *Beads) runWithRouting(args ...string) (_ []byte, retErr error) { //noli
 	defer func() {
 		telemetry.RecordBDCall(context.Background(), args, float64(time.Since(start).Milliseconds()), retErr, stdout.Bytes(), stderr.String())
 	}()
+	args = NormalizeAssigneeArgs(args)
 	runEnv := b.buildRoutingEnv()
 	fullArgs := MaybePrependAllowStaleWithEnv(runEnv, args)
 
@@ -1068,6 +1074,15 @@ func (b *Beads) List(opts ListOptions) ([]*Issue, error) {
 }
 
 func (b *Beads) listIssues(opts ListOptions) ([]*Issue, error) {
+	// Town-level agents have legacy rows stored under the trailing-slash form.
+	// bd list takes a single --assignee value, so query each variant and merge.
+	if variants := AssigneeQueryVariants(opts.Assignee); len(variants) > 1 {
+		return b.listAcrossAssigneeVariants(opts, variants, b.listIssuesForAssignee)
+	}
+	return b.listIssuesForAssignee(opts)
+}
+
+func (b *Beads) listIssuesForAssignee(opts ListOptions) ([]*Issue, error) {
 	args := []string{"list", "--json"}
 
 	if opts.Status != "" {
@@ -1195,8 +1210,18 @@ func (b *Beads) listEphemeral(opts ListOptions) ([]*Issue, error) {
 	if opts.Parent != "" {
 		clauses = append(clauses, "parent="+quoteBDQueryValue(opts.Parent))
 	}
-	if opts.Assignee != "" {
-		clauses = append(clauses, "assignee="+quoteBDQueryValue(opts.Assignee))
+	if variants := AssigneeQueryVariants(opts.Assignee); len(variants) > 0 {
+		// Town-level agents also match the legacy trailing-slash form so wisps
+		// written before normalization stay visible on the hook (hq-j5v).
+		terms := make([]string, 0, len(variants))
+		for _, variant := range variants {
+			terms = append(terms, "assignee="+quoteBDQueryValue(variant))
+		}
+		if len(terms) == 1 {
+			clauses = append(clauses, terms[0])
+		} else {
+			clauses = append(clauses, "("+strings.Join(terms, " OR ")+")")
+		}
 	}
 
 	queryExpr := strings.Join(clauses, " AND ")
@@ -1599,7 +1624,7 @@ func (b *Beads) FindLatestIssueByTitleAndAssignee(title, assignee string) (*Issu
 
 	var newest *Issue
 	for _, issue := range issues {
-		if issue.Title != title || issue.Assignee != assignee {
+		if issue.Title != title || !SameAssignee(issue.Assignee, assignee) {
 			continue
 		}
 		if newest == nil || issue.CreatedAt > newest.CreatedAt {
