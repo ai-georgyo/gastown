@@ -28,7 +28,7 @@
             pname = "gt";
             version = "1.0.0";
             src = ./.;
-            vendorHash = "sha256-mJzpsl4XnIm3ZSg7fFn0MOdQQW1bdOkAJ+TikiLMXJM=";
+            vendorHash = "sha256-ZUEQQ0br+5UQnk/XLM7NLDCd1qA93VOho1iQ3q3RUm8=";
 
             ldflags = [
               "-X github.com/gastownhall/gastown/internal/cmd.Build=nix"
@@ -36,6 +36,9 @@
             ];
 
             subPackages = [ "cmd/gt" ];
+
+            # go-icu-regex (pulled in via dolthub deps) is cgo and needs ICU headers/libs.
+            buildInputs = [ pkgs.icu ];
 
             meta = with pkgs.lib; {
               description = "Multi-agent orchestration system for Claude Code with persistent work tracking";
@@ -57,7 +60,7 @@
         devShells.default = pkgs.mkShell {
           buildInputs = [
             beadsPkg
-            pkgs.go_1_25
+            pkgs.go_1_26
             pkgs.gopls
             pkgs.gotools
             pkgs.go-tools
