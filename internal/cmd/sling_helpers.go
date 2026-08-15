@@ -949,9 +949,10 @@ func nudgeWitness(rigName, message string, eventFields ...string) {
 	if townRoot != "" {
 		fields := append([]string{
 			"source=polecat",
+			"rig=" + rigName,
 			"message=" + message,
 		}, eventFields...)
-		_, _ = channelevents.EmitToTown(townRoot, "witness", "POLECAT_DONE", fields)
+		_, _ = channelevents.EmitToRig(townRoot, rigName, "witness", "POLECAT_DONE", fields)
 	}
 
 	t := tmux.NewTmux()
@@ -981,10 +982,12 @@ func nudgeRefinery(rigName, message string) {
 
 	// Emit a file event so the refinery's await-event unblocks instantly.
 	// This is the programmatic bridge between mq submit and the event system.
+	// Scoped to the rig: only this rig's refinery should wake for this MR.
 	townRoot, _ := workspace.FindFromCwd()
 	if townRoot != "" {
-		_, _ = channelevents.EmitToTown(townRoot, "refinery", "MQ_SUBMIT", []string{
+		_, _ = channelevents.EmitToRig(townRoot, rigName, "refinery", "MQ_SUBMIT", []string{
 			"source=sling",
+			"rig=" + rigName,
 			"message=" + message,
 		})
 	}
