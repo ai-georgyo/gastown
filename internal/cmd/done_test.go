@@ -991,6 +991,75 @@ func TestShouldRetirePolecatSessionAfterDone(t *testing.T) {
 	}
 }
 
+func TestPolecatDoneIsTerminal(t *testing.T) {
+	tests := []struct {
+		name       string
+		exitType   string
+		pushFailed bool
+		mrFailed   bool
+		want       bool
+	}{
+		{"completed is terminal", ExitCompleted, false, false, true},
+		{"deferred is not terminal", ExitDeferred, false, false, false},
+		{"escalated is not terminal", ExitEscalated, false, false, false},
+		{"push failure is not terminal", ExitCompleted, true, false, false},
+		{"mr failure is not terminal", ExitCompleted, false, true, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := polecatDoneIsTerminal(tt.exitType, tt.pushFailed, tt.mrFailed)
+			if got != tt.want {
+				t.Errorf("polecatDoneIsTerminal(%q, %v, %v) = %v, want %v",
+					tt.exitType, tt.pushFailed, tt.mrFailed, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestPolecatDoneIsTerminalLocalStrategy documents the one case where a signal
+// is terminal even though the session is preserved: a local merge strategy
+// keeps the polecat alive for review, not for another gt done (gt-a2l).
+func TestPolecatDoneIsTerminalLocalStrategy(t *testing.T) {
+	if shouldRetirePolecatSessionAfterDone(ExitCompleted, "local", false, false) {
+		t.Fatal("local strategy should preserve the session")
+	}
+	if !polecatDoneIsTerminal(ExitCompleted, false, false) {
+		t.Error("a preserved local-strategy COMPLETED exit should still signal terminal=true")
+	}
+}
+
+func TestPolecatDoneSignal(t *testing.T) {
+	tests := []struct {
+		name     string
+		polecat  string
+		exitType string
+		terminal bool
+		want     string
+	}{
+		{"terminal completed", "slit", ExitCompleted, true, "POLECAT_DONE slit exit=COMPLETED terminal=true"},
+		{"non-terminal deferred", "furiosa", ExitDeferred, false, "POLECAT_DONE furiosa exit=DEFERRED terminal=false"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := polecatDoneSignal(tt.polecat, tt.exitType, tt.terminal)
+			if got != tt.want {
+				t.Errorf("polecatDoneSignal(%q, %q, %v) = %q, want %q",
+					tt.polecat, tt.exitType, tt.terminal, got, tt.want)
+			}
+			// The witness protocol parses the polecat name as the first field
+			// after the subject; extra fields must not shift it.
+			if !patternPolecatDone.MatchString(got) {
+				t.Errorf("signal %q no longer matches the POLECAT_DONE pattern", got)
+			}
+			if name := patternPolecatDone.FindStringSubmatch(got)[1]; name != tt.polecat {
+				t.Errorf("parsed polecat name = %q, want %q", name, tt.polecat)
+			}
+		})
+	}
+}
+
 type fakeDoneSessionKiller struct {
 	name        string
 	excludePIDs []string

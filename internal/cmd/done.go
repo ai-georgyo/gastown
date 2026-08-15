@@ -100,6 +100,34 @@ func shouldRetirePolecatSessionAfterDone(exitType, mergeStrategy string, pushFai
 	return mergeStrategy != "local"
 }
 
+// polecatDoneIsTerminal reports whether a gt done invocation is the last
+// POLECAT_DONE its session will emit.
+//
+// Every gt done emits a POLECAT_DONE signal, but only some of them end the
+// polecat's work: DEFERRED means "work paused, issue still open" and ESCALATED
+// means "blocked", so both leave the session alive and the agent commonly runs
+// gt done again — the witness then sees a second POLECAT_DONE from the same
+// polecat carrying a different, contradictory exit type (gt-a2l). A COMPLETED
+// exit whose push or MR submission failed is non-terminal for the same reason:
+// the session is preserved for recovery and the retry re-signals.
+//
+// This is deliberately weaker than shouldRetirePolecatSessionAfterDone, which
+// also requires a non-local merge strategy. A local-strategy COMPLETED exit
+// keeps the session alive for local review, not for another gt done, so its
+// signal is still terminal.
+func polecatDoneIsTerminal(exitType string, pushFailed, mrFailed bool) bool {
+	return exitType == ExitCompleted && !pushFailed && !mrFailed
+}
+
+// polecatDoneSignal formats the POLECAT_DONE nudge sent to the witness.
+// terminal=false marks the signal as advisory and supersedable: the exit type
+// describes this attempt, not the polecat's final state, so a consumer must
+// corroborate against bead status, git state, and the merge queue before
+// routing on it.
+func polecatDoneSignal(polecatName, exitType string, terminal bool) string {
+	return fmt.Sprintf("POLECAT_DONE %s exit=%s terminal=%t", polecatName, exitType, terminal)
+}
+
 type doneSessionKiller interface {
 	KillSessionWithProcessesExcluding(name string, excludePIDs []string) error
 }
@@ -1930,8 +1958,17 @@ notifyWitness:
 	// Nudge witness only after hook/cleanup state is updated. Otherwise witness can
 	// evaluate slot availability against stale hook_bead or cleanup_status and emit
 	// false SLOT_BLOCKED/SLOT_OPEN signals.
-	nudgeWitness(rigName, fmt.Sprintf("POLECAT_DONE %s exit=%s", polecatName, exitType))
-	fmt.Printf("%s Witness notified of %s (via nudge)\n", style.Bold.Render("✓"), exitType)
+	//
+	// The signal carries terminal=<bool> so the witness can tell a final signal
+	// from one that will be superseded: a non-terminal gt done leaves the session
+	// alive and the same polecat routinely emits POLECAT_DONE again with a
+	// different exit type minutes later (gt-a2l).
+	terminal := polecatDoneIsTerminal(exitType, pushFailed, mrFailed)
+	nudgeWitness(rigName, polecatDoneSignal(polecatName, exitType, terminal),
+		"polecat="+polecatName,
+		"exit="+exitType,
+		fmt.Sprintf("terminal=%t", terminal))
+	fmt.Printf("%s Witness notified of %s (via nudge, terminal=%t)\n", style.Bold.Render("✓"), exitType, terminal)
 
 	// Clean successful polecats are retired after durable handoff. Preserve the
 	// feature branch and metadata; Witness/refinery cleanup owns the sandbox.

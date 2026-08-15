@@ -29,6 +29,22 @@ Branch: <branch>
 
 **Handler**: Witness creates a cleanup wisp for the polecat.
 
+**Nudge form** (the live path — mail is the fallback):
+
+```
+POLECAT_DONE <polecat-name> exit=<type> terminal=<bool>
+```
+
+**`exit` is advisory, not authoritative (gt-a2l).** Every `gt done` emits a
+POLECAT_DONE, including invocations that don't end the polecat's work. DEFERRED
+and ESCALATED exits — and COMPLETED exits whose push or MR submission failed —
+leave the session alive, and the same polecat commonly emits POLECAT_DONE again
+with a different exit type.
+
+`terminal=true` marks the last signal a session will emit. On `terminal=false`,
+treat the message as a wake-up and re-derive the polecat's real state from bead
+status, git state, and the merge queue before routing.
+
 ### MERGE_READY
 
 **Route**: Witness → Refinery

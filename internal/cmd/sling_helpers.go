@@ -927,7 +927,10 @@ func wakeRigAgents(rigName string) {
 // nudgeWitness wakes the witness after polecat completion (gt-a6gp).
 // Replaces POLECAT_DONE mail — nudges are free (no Dolt commit).
 // Uses immediate delivery: sends directly to the tmux pane.
-func nudgeWitness(rigName, message string) {
+//
+// eventFields are appended to the emitted channel event as key=value pairs so
+// event consumers can route without re-parsing the free-text message.
+func nudgeWitness(rigName, message string, eventFields ...string) {
 	witnessSession := session.WitnessSessionName(session.PrefixFor(rigName))
 
 	// Test hook: log nudge for test observability
@@ -944,10 +947,11 @@ func nudgeWitness(rigName, message string) {
 	// Emit a file event so the witness's await-event unblocks instantly.
 	townRoot, _ := workspace.FindFromCwd()
 	if townRoot != "" {
-		_, _ = channelevents.EmitToTown(townRoot, "witness", "POLECAT_DONE", []string{
+		fields := append([]string{
 			"source=polecat",
 			"message=" + message,
-		})
+		}, eventFields...)
+		_, _ = channelevents.EmitToTown(townRoot, "witness", "POLECAT_DONE", fields)
 	}
 
 	t := tmux.NewTmux()
