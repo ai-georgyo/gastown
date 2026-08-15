@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
+	"time"
 
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/cli"
@@ -300,19 +301,26 @@ func autoSpawnPatrol(cfg PatrolConfig) (string, error) {
 		return patrolID, fmt.Errorf("created wisp %s but failed to hook", patrolID)
 	}
 
-	desc, err := renderPatrolWispDescription(cfg)
+	// Cook the formula onto the wisp. The rendered body is only half of it:
+	// without the attachment fields the wisp is inert — it hooks fine but
+	// gt hook reports "No molecule attached" and gt prime renders no checklist
+	// (gt-yus). Both are written in a single update so a render failure still
+	// leaves an executable wisp.
+	body, err := renderPatrolWispDescription(cfg)
 	if err != nil {
 		style.PrintWarning("could not render patrol description for %s: %v", patrolID, err)
-	} else if err := updatePatrolWispDescription(cfg, resolvedBeadsDir, patrolID, desc); err != nil {
+	}
+	if err := updatePatrolWispDescription(cfg, resolvedBeadsDir, patrolID, cookPatrolWispDescription(cfg, body)); err != nil {
 		style.PrintWarning("could not write patrol description for %s: %v", patrolID, err)
 	}
 
 	return patrolID, nil
 }
 
-func renderPatrolWispDescription(cfg PatrolConfig) (string, error) {
-	rigName := patrolRigName(cfg)
-	ctx := RoleContext{TownRoot: cfg.BeadsDir, Rig: rigName}
+// patrolWispVars returns the formula variables the patrol wisp is instantiated
+// with: the role's derived vars plus any caller-supplied overrides.
+func patrolWispVars(cfg PatrolConfig) []string {
+	ctx := RoleContext{TownRoot: cfg.BeadsDir, Rig: patrolRigName(cfg)}
 	var vars []string
 	switch cfg.PatrolMolName {
 	case constants.MolWitnessPatrol:
@@ -320,8 +328,27 @@ func renderPatrolWispDescription(cfg PatrolConfig) (string, error) {
 	case constants.MolRefineryPatrol:
 		vars = buildRefineryPatrolVars(ctx)
 	}
-	vars = append(vars, cfg.ExtraVars...)
-	return renderFormulaRootAndStepsFull(cfg.PatrolMolName, cfg.BeadsDir, rigName, vars)
+	return append(vars, cfg.ExtraVars...)
+}
+
+// cookPatrolWispDescription stamps the workflow attachment fields onto the
+// rendered formula body, producing the description that makes a root-only
+// patrol wisp executable. This is the same metadata gt sling stores via
+// storeFieldsInBead, so gt hook and gt prime treat both wisps identically.
+func cookPatrolWispDescription(cfg PatrolConfig, body string) string {
+	vars := patrolWispVars(cfg)
+	fields := &beads.AttachmentFields{
+		AttachedFormula: cfg.PatrolMolName,
+		AttachedAt:      time.Now().UTC().Format(time.RFC3339Nano),
+		AttachedVars:    vars,
+		DispatchedBy:    cfg.RoleName,
+		FormulaVars:     strings.Join(vars, "\n"),
+	}
+	return beads.SetAttachmentFields(&beads.Issue{Description: strings.TrimSpace(body)}, fields)
+}
+
+func renderPatrolWispDescription(cfg PatrolConfig) (string, error) {
+	return renderFormulaRootAndStepsFull(cfg.PatrolMolName, cfg.BeadsDir, patrolRigName(cfg), patrolWispVars(cfg))
 }
 
 func patrolRigName(cfg PatrolConfig) string {

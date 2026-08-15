@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -19,6 +20,7 @@ import (
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
+	"github.com/steveyegge/gastown/internal/formula"
 	"github.com/steveyegge/gastown/internal/refinery"
 	"github.com/steveyegge/gastown/internal/testutil"
 )
@@ -797,6 +799,138 @@ echo stdin:%stdin% >> %BD_STUB_LOG%
 	}
 	if !strings.Contains(log, "stdin:line one\nline two") {
 		t.Fatalf("expected multiline description on stdin, got:\n%s", log)
+	}
+}
+
+// embeddedFormulaStepCount returns the number of steps in an embedded formula,
+// so tests assert against the real checklist instead of a hardcoded count that
+// drifts every time a step is added.
+func embeddedFormulaStepCount(t *testing.T, formulaName string) int {
+	t.Helper()
+	content, err := formula.GetEmbeddedFormulaContent(formulaName)
+	if err != nil {
+		t.Fatalf("load formula %s: %v", formulaName, err)
+	}
+	f, err := formula.Parse(content)
+	if err != nil {
+		t.Fatalf("parse formula %s: %v", formulaName, err)
+	}
+	if len(f.Steps) == 0 {
+		t.Fatalf("formula %s has no steps", formulaName)
+	}
+	return len(f.Steps)
+}
+
+func TestCookPatrolWispDescription_StampsFormulaAttachment(t *testing.T) {
+	cfg := PatrolConfig{
+		RoleName:      "deacon",
+		PatrolMolName: constants.MolDeaconPatrol,
+		BeadsDir:      t.TempDir(),
+		Assignee:      "deacon",
+		ExtraVars:     []string{"idle_effort_threshold=7"},
+	}
+	body, err := renderPatrolWispDescription(cfg)
+	if err != nil {
+		t.Fatalf("renderPatrolWispDescription: %v", err)
+	}
+
+	desc := cookPatrolWispDescription(cfg, body)
+
+	fields := beads.ParseAttachmentFields(&beads.Issue{Description: desc})
+	if fields == nil {
+		t.Fatalf("no attachment fields on cooked description:\n%s", desc)
+	}
+	if fields.AttachedFormula != constants.MolDeaconPatrol {
+		t.Fatalf("attached_formula = %q, want %q", fields.AttachedFormula, constants.MolDeaconPatrol)
+	}
+	if fields.AttachedAt == "" {
+		t.Fatalf("attached_at not stamped:\n%s", desc)
+	}
+	if fields.DispatchedBy != "deacon" {
+		t.Fatalf("dispatched_by = %q, want deacon", fields.DispatchedBy)
+	}
+	// Vars must survive so gt prime renders the same substituted steps the
+	// wisp was created with.
+	if got := attachmentFormulaVars(fields); !slices.Contains(got, "idle_effort_threshold=7") {
+		t.Fatalf("formula vars = %v, want idle_effort_threshold=7", got)
+	}
+	// The rendered checklist must survive the field stamping.
+	wantHeader := fmt.Sprintf("**Formula Checklist** (%d steps from %s)", embeddedFormulaStepCount(t, constants.MolDeaconPatrol), constants.MolDeaconPatrol)
+	if !strings.Contains(desc, wantHeader) {
+		t.Fatalf("cooked description missing %q:\n%s", wantHeader, desc)
+	}
+	if !strings.Contains(desc, "### Step 1: Refresh heartbeat") {
+		t.Fatalf("cooked description missing first step:\n%s", desc)
+	}
+}
+
+// TestAutoSpawnPatrol_CooksFormulaOntoNewWisp is the regression test for gt-yus:
+// the next-cycle wisp `gt patrol report` arms must carry a cooked formula, not
+// just exist. The bug reported success while producing an inert wisp, so this
+// asserts on the actual steps and attachment metadata written to the wisp.
+func TestAutoSpawnPatrol_CooksFormulaOntoNewWisp(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("mock bd/gt scripts use POSIX shell")
+	}
+
+	townRoot := t.TempDir()
+	binDir := t.TempDir()
+	descPath := filepath.Join(t.TempDir(), "wisp-description.txt")
+
+	// gt formula list: the catalog autoSpawnPatrol resolves the proto ID from.
+	gtScript := "#!/usr/bin/env sh\n" +
+		"if [ \"$1\" = \"formula\" ] && [ \"$2\" = \"list\" ]; then\n" +
+		"  echo \"" + constants.MolDeaconPatrol + "  Deacon patrol loop\"\n" +
+		"fi\n"
+	if err := os.WriteFile(filepath.Join(binDir, "gt"), []byte(gtScript), 0o755); err != nil {
+		t.Fatalf("write fake gt: %v", err)
+	}
+
+	writeBDStub(t, binDir, `#!/usr/bin/env sh
+case "$*" in
+  *"mol wisp create"*)
+    echo "Root issue: hq-wisp-cooked"
+    ;;
+  *"--body-file=-"*)
+    cat > "$BD_STUB_DESC"
+    ;;
+  *list*)
+    echo "[]"
+    ;;
+esac
+`, "")
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("BD_STUB_DESC", descPath)
+
+	patrolID, err := autoSpawnPatrol(PatrolConfig{
+		RoleName:      "deacon",
+		PatrolMolName: constants.MolDeaconPatrol,
+		BeadsDir:      townRoot,
+		Assignee:      "deacon",
+	})
+	if err != nil {
+		t.Fatalf("autoSpawnPatrol: %v", err)
+	}
+	if patrolID != "hq-wisp-cooked" {
+		t.Fatalf("patrolID = %q, want hq-wisp-cooked", patrolID)
+	}
+
+	data, err := os.ReadFile(descPath)
+	if err != nil {
+		t.Fatalf("new patrol wisp never had a description written: %v", err)
+	}
+	desc := string(data)
+
+	fields := beads.ParseAttachmentFields(&beads.Issue{Description: desc})
+	if fields == nil || fields.AttachedFormula != constants.MolDeaconPatrol {
+		t.Fatalf("new patrol wisp has no cooked formula (gt hook would report \"No molecule attached\"):\n%s", desc)
+	}
+	wantHeader := fmt.Sprintf("**Formula Checklist** (%d steps from %s)", embeddedFormulaStepCount(t, constants.MolDeaconPatrol), constants.MolDeaconPatrol)
+	if !strings.Contains(desc, wantHeader) {
+		t.Fatalf("new patrol wisp missing %q:\n%s", wantHeader, desc)
+	}
+	if !strings.Contains(desc, "### Step 1: Refresh heartbeat") {
+		t.Fatalf("new patrol wisp missing first executable step:\n%s", desc)
 	}
 }
 
