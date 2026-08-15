@@ -2832,3 +2832,193 @@ func TestHandleZombieRestart_RestartsWhenBranchNotMerged(t *testing.T) {
 		t.Errorf("action = %q, should not archive when work is not merged", z.Action)
 	}
 }
+
+func TestUncorroboratedCompletionReason(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		c    completionCorroboration
+		want bool // want a decline
+	}{
+		// The gt-8yl specimen shape: a COMPLETED claim nothing supports and the
+		// polecat's own state disputes.
+		{"completed disputed by stuck with no evidence declines",
+			completionCorroboration{ExitType: "COMPLETED", AgentState: "stuck"}, true},
+		{"completed disputed by escalated with no evidence declines",
+			completionCorroboration{ExitType: "COMPLETED", AgentState: "escalated"}, true},
+		{"completed whose own invocation reported MR failure declines",
+			completionCorroboration{ExitType: "COMPLETED", MRFailed: true}, true},
+
+		// Independent evidence settles it — a stale agent_state must never
+		// strand work that demonstrably landed. This is the case valkyrie's
+		// falsification protects: agent_state is not a discriminator.
+		{"queued MR outweighs a disputing agent_state",
+			completionCorroboration{ExitType: "COMPLETED", AgentState: "stuck", MRQueued: true}, false},
+		{"closed source bead outweighs a disputing agent_state",
+			completionCorroboration{ExitType: "COMPLETED", AgentState: "stuck", IssueClosed: true}, false},
+		{"queued MR outweighs a reported MR failure",
+			completionCorroboration{ExitType: "COMPLETED", MRFailed: true, MRQueued: true}, false},
+
+		// Nothing disputes the claim: an absent MR is normal for report-only and
+		// no-code completions, so this must keep routing as before.
+		{"undisputed completion with no MR still routes",
+			completionCorroboration{ExitType: "COMPLETED", AgentState: "done"}, false},
+		{"undisputed completion mid-write still routes",
+			completionCorroboration{ExitType: "COMPLETED", AgentState: "working"}, false},
+		{"missing agent state alone cannot decline",
+			completionCorroboration{ExitType: "COMPLETED"}, false},
+
+		// Handled elsewhere.
+		{"push failure is routed by the push-failed path",
+			completionCorroboration{ExitType: "COMPLETED", AgentState: "stuck", PushFailed: true}, false},
+
+		// Only COMPLETED has to earn its routing.
+		{"deferred beside done is not second-guessed",
+			completionCorroboration{ExitType: "DEFERRED", AgentState: "done"}, false},
+		{"escalated beside done is not second-guessed",
+			completionCorroboration{ExitType: "ESCALATED", AgentState: "done"}, false},
+		{"phase complete is never declined",
+			completionCorroboration{ExitType: "PHASE_COMPLETE", AgentState: "stuck"}, false},
+
+		// Case and padding are incidental.
+		{"case insensitive",
+			completionCorroboration{ExitType: " completed ", AgentState: " STUCK "}, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := uncorroboratedCompletionReason(tt.c)
+			if (got != "") != tt.want {
+				t.Errorf("uncorroboratedCompletionReason(%+v) = %q, want decline=%v", tt.c, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestDiscoverCompletions_DeclinesUncorroborated is criterion 2 of gt-8yl: the
+// primary completion-discovery path must not route a COMPLETED claim that
+// nothing independent supports and the polecat's own state disputes, and must
+// not clear the metadata that records the disagreement.
+func TestDiscoverCompletions_DeclinesUncorroborated(t *testing.T) {
+	tmpDir := t.TempDir()
+	rigName := "testrig"
+	if err := os.MkdirAll(filepath.Join(tmpDir, rigName, "polecats", "nux"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tmpDir, ".gt-root"), []byte(""), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// The nux specimen shape: a COMPLETED exit sitting beside an agent_state left
+	// over from an earlier DEFERRED exit, with no MR queued and the source bead
+	// still open. mr_failed is set so the same invocation is on record as having
+	// failed to submit.
+	description := "Agent: testrig/polecats/nux\n\nrole_type: polecat\nrig: testrig\n" +
+		"agent_state: stuck\nhook_bead: null\nexit_type: COMPLETED\n" +
+		"branch: polecat/nux/gt-23p\nlast_source_issue: gt-23p\nmr_failed: true\n" +
+		"completion_time: 2026-08-15T12:41:13Z"
+	bd, mock := mockBd(
+		func(args []string) (string, error) {
+			if len(args) > 0 && args[0] == "show" {
+				payload, err := json.Marshal([]map[string]string{{
+					"id":          "gt-testrig-polecat-nux",
+					"title":       "gt-testrig-polecat-nux",
+					"description": description,
+				}})
+				if err != nil {
+					return "", err
+				}
+				return string(payload), nil
+			}
+			return "[]", nil
+		},
+		func(args []string) error { return nil },
+	)
+
+	result := DiscoverCompletions(bd, tmpDir, rigName, nil)
+
+	if len(result.Discovered) != 1 {
+		t.Fatalf("Discovered = %d, want 1", len(result.Discovered))
+	}
+	d := result.Discovered[0]
+	if d.Uncorroborated == "" {
+		t.Error("Uncorroborated is empty, want a reason the COMPLETED claim was not accepted")
+	}
+	if d.AgentState != "stuck" {
+		t.Errorf("AgentState = %q, want %q", d.AgentState, "stuck")
+	}
+	if !strings.Contains(d.Action, "declined-uncorroborated") {
+		t.Errorf("Action = %q, want it to report the completion was declined", d.Action)
+	}
+	if d.WispCreated != "" {
+		t.Errorf("WispCreated = %q, want no cleanup wisp for a declined completion", d.WispCreated)
+	}
+	// The metadata is the only durable record that anything was inconsistent.
+	// Clearing it would erase the evidence — and, for a COMPLETED exit whose
+	// push failed, the record that the work never reached origin.
+	for _, call := range mock.calls {
+		if strings.HasPrefix(call, "update ") {
+			t.Errorf("declined completion issued a write: %q — metadata must be preserved", call)
+		}
+	}
+}
+
+// TestDiscoverCompletions_RoutesUndisputed is the control for the test above:
+// an exit type nothing disputes must still be routed and cleared as before.
+func TestDiscoverCompletions_RoutesUndisputed(t *testing.T) {
+	tmpDir := t.TempDir()
+	rigName := "testrig"
+	if err := os.MkdirAll(filepath.Join(tmpDir, rigName, "polecats", "nux"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tmpDir, ".gt-root"), []byte(""), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	description := "Agent: testrig/polecats/nux\n\nrole_type: polecat\nrig: testrig\n" +
+		"agent_state: stuck\nhook_bead: null\nexit_type: DEFERRED\n" +
+		"branch: polecat/nux/gt-23p\nlast_source_issue: gt-23p\n" +
+		"completion_time: 2026-08-15T12:41:13Z"
+	bd, mock := mockBd(
+		func(args []string) (string, error) {
+			if len(args) > 0 && args[0] == "show" {
+				payload, err := json.Marshal([]map[string]string{{
+					"id":          "gt-testrig-polecat-nux",
+					"title":       "gt-testrig-polecat-nux",
+					"description": description,
+				}})
+				if err != nil {
+					return "", err
+				}
+				return string(payload), nil
+			}
+			return "[]", nil
+		},
+		func(args []string) error { return nil },
+	)
+
+	result := DiscoverCompletions(bd, tmpDir, rigName, nil)
+
+	if len(result.Discovered) != 1 {
+		t.Fatalf("Discovered = %d, want 1", len(result.Discovered))
+	}
+	d := result.Discovered[0]
+	if d.Uncorroborated != "" {
+		t.Errorf("Uncorroborated = %q, want none for DEFERRED beside stuck", d.Uncorroborated)
+	}
+	if !strings.Contains(d.Action, "acknowledged-idle") {
+		t.Errorf("Action = %q, want the completion to be routed", d.Action)
+	}
+	// Proves the "no writes" assertion in the declined test is meaningful: a
+	// routed completion DOES clear its metadata through this same call path.
+	cleared := false
+	for _, call := range mock.calls {
+		if strings.HasPrefix(call, "update ") {
+			cleared = true
+		}
+	}
+	if !cleared {
+		t.Error("routed completion issued no update — expected its metadata to be cleared")
+	}
+}

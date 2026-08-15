@@ -118,8 +118,12 @@ type PatrolScanCompleteOutput struct {
 
 // PatrolScanCompleteItem is a single completion discovery in scan output.
 type PatrolScanCompleteItem struct {
-	Polecat        string `json:"polecat"`
-	ExitType       string `json:"exit_type"`
+	Polecat  string `json:"polecat"`
+	ExitType string `json:"exit_type"`
+	// AgentState and Uncorroborated are populated when a completion was not
+	// routed because its exit_type could not be corroborated (gt-8yl).
+	AgentState     string `json:"agent_state,omitempty"`
+	Uncorroborated string `json:"uncorroborated,omitempty"`
 	IssueID        string `json:"issue_id,omitempty"`
 	MRID           string `json:"mr_id,omitempty"`
 	Branch         string `json:"branch,omitempty"`
@@ -349,12 +353,16 @@ func outputPatrolScanJSON(rigName, timestamp string, zombieResult *witness.Detec
 			item := PatrolScanCompleteItem{
 				Polecat:        d.PolecatName,
 				ExitType:       d.ExitType,
+				Uncorroborated: d.Uncorroborated,
 				IssueID:        d.IssueID,
 				MRID:           d.MRID,
 				Branch:         d.Branch,
 				Action:         d.Action,
 				WispCreated:    d.WispCreated,
 				CompletionTime: d.CompletionTime,
+			}
+			if d.Uncorroborated != "" {
+				item.AgentState = d.AgentState
 			}
 			co.Completed = append(co.Completed, item)
 		}
@@ -438,7 +446,14 @@ func outputPatrolScanHuman(rigName string, zombieResult *witness.DetectZombiePol
 			fmt.Printf("  %s\n", style.Dim.Render("No completions discovered"))
 		} else {
 			for _, d := range completionResult.Discovered {
-				fmt.Printf("  ● %s: exit=%s", d.PolecatName, d.ExitType)
+				marker := "●"
+				if d.Uncorroborated != "" {
+					marker = "⚠"
+				}
+				fmt.Printf("  %s %s: exit=%s", marker, d.PolecatName, d.ExitType)
+				if d.Uncorroborated != "" {
+					fmt.Printf("  agent_state=%s", d.AgentState)
+				}
 				if d.IssueID != "" {
 					fmt.Printf("  issue=%s", d.IssueID)
 				}

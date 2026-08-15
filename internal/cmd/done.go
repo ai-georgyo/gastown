@@ -119,6 +119,24 @@ func polecatDoneIsTerminal(exitType string, pushFailed, mrFailed bool) bool {
 	return exitType == ExitCompleted && !pushFailed && !mrFailed
 }
 
+// newCompletionMetadata builds the completion record gt done writes to the
+// agent bead. exitType is recorded verbatim — it is the status THIS invocation
+// was asked for, so a `gt done --status DEFERRED` writes exit_type=DEFERRED even
+// when an earlier invocation of the same session wrote something else (gt-8yl).
+// The record is only ever as current as the invocation that wrote it; consumers
+// must corroborate it rather than treat it as the polecat's standing state.
+func newCompletionMetadata(exitType, mrID, branch, issueID string, mrFailed, pushFailed bool, now time.Time) *beads.CompletionMetadata {
+	return &beads.CompletionMetadata{
+		ExitType:       exitType,
+		MRID:           mrID,
+		Branch:         branch,
+		HookBead:       issueID,
+		MRFailed:       mrFailed,
+		PushFailed:     pushFailed,
+		CompletionTime: now.UTC().Format(time.RFC3339),
+	}
+}
+
 // polecatDoneSignal formats the POLECAT_DONE nudge sent to the witness.
 // terminal=false marks the signal as advisory and supersedable: the exit type
 // describes this attempt, not the polecat's final state, so a consumer must
@@ -146,12 +164,36 @@ var newDoneSessionKiller = func() doneSessionKiller {
 
 var updateAgentStateOnDoneFn = updateAgentStateOnDone
 
+var markAgentStuckAfterFailedSubmissionFn = markAgentStuckAfterFailedSubmission
+
 func updateAgentStateAfterSubmission(cwd, townRoot, exitType, issueID string, pushFailed, mrFailed bool) error {
 	if !shouldUpdateAgentStateOnDone(pushFailed, mrFailed) {
 		style.PrintWarning("skipping agent cleanup because push or MR submission failed")
+		// Cleanup is skipped so the hook survives for recovery, but agent_state
+		// must still describe THIS invocation. Leaving it untouched is what let
+		// a stale state from an earlier gt done sit next to the exit_type this
+		// one just wrote — the pair then describes two different invocations and
+		// completion discovery reads the older half (gt-8yl). "stuck" is the
+		// truth for a submission that never reached origin, and it protects the
+		// worktree from stale-cleanup (AgentState.ProtectsFromCleanup).
+		markAgentStuckAfterFailedSubmissionFn(cwd, townRoot)
 		return nil
 	}
 	return updateAgentStateOnDoneFn(cwd, townRoot, exitType, issueID)
+}
+
+// markAgentStuckAfterFailedSubmission sets agent_state=stuck without touching
+// the hook, the hooked bead, or the done-intent labels. Best-effort: gt done
+// must complete even when the bead write fails.
+func markAgentStuckAfterFailedSubmission(cwd, townRoot string) {
+	resolved, ok := resolveDoneAgentBead(cwd, townRoot)
+	if !ok {
+		return
+	}
+	agentBd := beads.New(resolved.BeadsPath).ForAgentBead()
+	if err := agentBd.UpdateAgentState(resolved.AgentBeadID, string(beads.AgentStateStuck)); err != nil {
+		style.PrintWarning("could not mark agent %s stuck after failed submission: %v", resolved.AgentBeadID, err)
+	}
 }
 
 func resolveDonePolecatWorktree() (donePolecatWorktree, error) {
@@ -1983,15 +2025,7 @@ notifyWitness:
 	if agentBeadID != "" {
 		// Agent bead lives in town DB despite rig prefix — bypass routing.
 		completionBd := beads.New(cwd).ForAgentBead()
-		meta := &beads.CompletionMetadata{
-			ExitType:       exitType,
-			MRID:           mrID,
-			Branch:         branch,
-			HookBead:       issueID,
-			MRFailed:       mrFailed,
-			PushFailed:     pushFailed,
-			CompletionTime: time.Now().UTC().Format(time.RFC3339),
-		}
+		meta := newCompletionMetadata(exitType, mrID, branch, issueID, mrFailed, pushFailed, time.Now())
 		if err := completionBd.UpdateAgentCompletion(agentBeadID, meta); err != nil {
 			style.PrintWarning("could not write completion metadata to agent bead: %v", err)
 		}
@@ -2345,7 +2379,19 @@ func clearDoneCheckpoints(bd *beads.Beads, agentBeadID string) {
 // BUG FIX (hq-3xaxy): This function must be resilient to working directory deletion.
 // If the polecat's worktree is deleted before gt done finishes, we use env vars as fallback.
 // All errors are warnings, not failures - gt done must complete even if bead ops fail.
-func updateAgentStateOnDone(cwd, townRoot, exitType, issueID string) error {
+// doneAgentBeadContext identifies the agent bead gt done must write to, plus
+// the beads directory its commands run against.
+type doneAgentBeadContext struct {
+	RoleInfo    RoleInfo
+	Ctx         RoleContext
+	BeadsPath   string
+	AgentBeadID string
+}
+
+// resolveDoneAgentBead locates the caller's agent bead. Returns ok=false (with a
+// warning already printed) when the role or the bead ID cannot be determined —
+// gt done must still complete in that case.
+func resolveDoneAgentBead(cwd, townRoot string) (doneAgentBeadContext, bool) {
 	// Get role context - try multiple sources for resilience
 	roleInfo, err := GetRoleWithContext(cwd, townRoot)
 	if err != nil {
@@ -2358,7 +2404,7 @@ func updateAgentStateOnDone(cwd, townRoot, exitType, issueID string) error {
 		if envRole == "" || envRig == "" {
 			// Can't determine role, skip agent state update
 			style.PrintWarning("could not determine role for agent state update (env: GT_ROLE=%q, GT_RIG=%q)", envRole, envRig)
-			return nil
+			return doneAgentBeadContext{}, false
 		}
 
 		// Parse role string to get Role type
@@ -2385,7 +2431,7 @@ func updateAgentStateOnDone(cwd, townRoot, exitType, issueID string) error {
 	agentBeadID := getAgentBeadID(ctx)
 	if agentBeadID == "" {
 		style.PrintWarning("no agent bead ID found for %s/%s, skipping agent state update", ctx.Rig, ctx.Polecat)
-		return nil
+		return doneAgentBeadContext{}, false
 	}
 
 	// Use rig path for bd commands.
@@ -2398,6 +2444,25 @@ func updateAgentStateOnDone(cwd, townRoot, exitType, issueID string) error {
 	default:
 		beadsPath = filepath.Join(townRoot, ctx.Rig)
 	}
+
+	return doneAgentBeadContext{
+		RoleInfo:    roleInfo,
+		Ctx:         ctx,
+		BeadsPath:   beadsPath,
+		AgentBeadID: agentBeadID,
+	}, true
+}
+
+func updateAgentStateOnDone(cwd, townRoot, exitType, issueID string) error {
+	resolved, ok := resolveDoneAgentBead(cwd, townRoot)
+	if !ok {
+		return nil
+	}
+	roleInfo := resolved.RoleInfo
+	ctx := resolved.Ctx
+	agentBeadID := resolved.AgentBeadID
+	beadsPath := resolved.BeadsPath
+
 	bd := beads.New(beadsPath)
 	// agentBd bypasses prefix routing — agent beads (gt:agent label) live in
 	// the town DB regardless of their ID prefix, but the rig-prefix routing
