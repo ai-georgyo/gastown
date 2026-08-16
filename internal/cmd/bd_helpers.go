@@ -41,7 +41,10 @@ type bdCmd struct {
 //	    Run()
 func BdCmd(args ...string) *bdCmd {
 	return &bdCmd{
-		args:   args,
+		// Canonicalize agent identity before it reaches bd's assignee column
+		// so callers cannot write a form their own agent can't find or own.
+		// See internal/beads/agent_address.go.
+		args:   beads.NormalizeAssigneeArgs(args),
 		env:    os.Environ(),
 		stderr: os.Stderr,
 	}

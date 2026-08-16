@@ -1320,7 +1320,7 @@ func hookBeadWithRetryWithTownRoot(beadID, targetAgent, hookDir, townRoot string
 			return fmt.Errorf("verifying hook after %d attempts: %w", maxRetries, lastErr)
 		}
 
-		if verifyInfo.Status != "hooked" || verifyInfo.Assignee != targetAgent {
+		if verifyInfo.Status != "hooked" || !beads.SameAssignee(verifyInfo.Assignee, targetAgent) {
 			lastErr = fmt.Errorf("hook did not stick: status=%s, assignee=%s (expected hooked, %s)",
 				verifyInfo.Status, verifyInfo.Assignee, targetAgent)
 			if attempt < maxRetries {

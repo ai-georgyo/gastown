@@ -1555,7 +1555,7 @@ func partialSpawnWithoutDurableHook(bd issueShower, fields *beads.AgentFields, a
 	if err != nil || issue == nil {
 		return false, ""
 	}
-	if (issue.Status == beads.StatusHooked && issue.Assignee == assignee) || issue.Assignee == assignee {
+	if beads.SameAssignee(issue.Assignee, assignee) {
 		return false, ""
 	}
 	return true, fmt.Sprintf("partial_spawn_without_durable_hook agent_state=%s hook_bead=%s hook_status=%s hook_assignee=%q", fields.AgentState, fields.HookBead, issue.Status, issue.Assignee)

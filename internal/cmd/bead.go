@@ -180,7 +180,7 @@ func runBeadMove(cmd *cobra.Command, args []string) error {
 	}
 
 	// Create the new bead
-	createCmd := exec.Command("bd", createArgs...)
+	createCmd := exec.Command("bd", beads.NormalizeAssigneeArgs(createArgs)...)
 	createCmd.Stderr = os.Stderr
 	newIDBytes, err := createCmd.Output()
 	if err != nil {

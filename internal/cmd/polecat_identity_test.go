@@ -163,16 +163,18 @@ func TestSessionToAgentID_Fallback(t *testing.T) {
 	}
 }
 
-// TestSessionToAgentID_TownLevel pins down GH#3699: town-level agents (mayor,
-// deacon) must produce a trailing-slash address so writes from gt sling match
-// the form queried by gt hook / runMoleculeStatus / buildAgentIdentity.
+// TestSessionToAgentID_TownLevel pins down GH#3699 / hq-j5v / hq-516:
+// town-level agents (mayor, deacon) must produce the bare address, with NO
+// trailing slash, so writes from gt sling match the form queried by gt hook /
+// runMoleculeStatus / buildAgentIdentity — and so bd's ownership check, which
+// compares assignee against BD_ACTOR ("deacon"), accepts the agent's own beads.
 func TestSessionToAgentID_TownLevel(t *testing.T) {
 	tests := []struct {
 		session string
 		want    string
 	}{
-		{"hq-mayor", "mayor/"},
-		{"hq-deacon", "deacon/"},
+		{"hq-mayor", "mayor"},
+		{"hq-deacon", "deacon"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.session, func(t *testing.T) {

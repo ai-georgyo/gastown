@@ -69,6 +69,13 @@ func runBdCommand(ctx context.Context, args []string, workDir, beadsDir string, 
 	// own injection. (GH#2746)
 	args = beads.InjectFlatForListJSON(args)
 
+	// Mail beads are assigned to the recipient's identity. The mail address
+	// namespace keeps its trailing slash ("deacon/"), but bd's assignee column
+	// must hold the canonical bare form or bd's ownership check rejects the
+	// recipient archiving its own mail (hq-516). Reads are left untouched so
+	// legacy slashed rows remain findable via Mailbox.identityVariants.
+	args = beads.NormalizeAssigneeArgs(args)
+
 	cmd := exec.CommandContext(ctx, "bd", args...) //nolint:gosec // G204: bd is a trusted internal tool
 	cmd.Dir = workDir
 	util.SetDetachedProcessGroup(cmd)

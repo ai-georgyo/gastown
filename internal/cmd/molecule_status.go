@@ -516,14 +516,20 @@ func extractRoleFromIdentity(target string) string {
 }
 
 // buildAgentIdentity constructs the agent identity string from role context.
-// Town-level agents (mayor, deacon) use trailing slash to match the format
-// used when setting assignee on hooked beads (see resolveSelfTarget in sling.go).
+// This is the single producer of bead-assignee identity for the current agent:
+// resolveSelfTarget and the patrol configs all route through it, so a role can
+// only have one assignee spelling.
+//
+// Town-level agents (mayor, deacon) use the bare name with NO trailing slash.
+// That is the canonical form because bd matches a bead's assignee against
+// BD_ACTOR when deciding ownership, and config.AgentEnv sets BD_ACTOR to the
+// bare role name. See internal/beads/agent_address.go for the full rationale.
 func buildAgentIdentity(ctx RoleContext) string {
 	switch ctx.Role {
 	case RoleMayor:
-		return "mayor/"
+		return "mayor"
 	case RoleDeacon:
-		return "deacon/"
+		return "deacon"
 	case RoleBoot:
 		return "deacon/boot"
 	case RoleWitness:

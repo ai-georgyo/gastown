@@ -380,7 +380,7 @@ func runMailArchive(cmd *cobra.Command, args []string) error {
 			fmt.Printf("  %s %s: underlying bead already gone (GC'd), entry cleared\n",
 				style.Dim.Render("note"), msgID)
 		default:
-			errMsgs = append(errMsgs, fmt.Sprintf("%s: %v", msgID, err))
+			errMsgs = append(errMsgs, formatArchiveError(msgID, err))
 		}
 	}
 
@@ -464,7 +464,7 @@ func runMailArchiveStale(mailbox *mail.Mailbox, address string) error {
 			fmt.Printf("  %s %s: underlying bead already gone (GC'd), entry cleared\n",
 				style.Dim.Render("note"), stale.Message.ID)
 		default:
-			errMsgs = append(errMsgs, fmt.Sprintf("%s: %v", stale.Message.ID, err))
+			errMsgs = append(errMsgs, formatArchiveError(stale.Message.ID, err))
 		}
 	}
 
@@ -483,6 +483,25 @@ func runMailArchiveStale(mailbox *mail.Mailbox, address string) error {
 		fmt.Printf("%s Archived %d stale messages\n", style.Bold.Render("✓"), total)
 	}
 	return nil
+}
+
+// formatArchiveError renders an archive failure with a remedy the reader can
+// actually run.
+//
+// bd refuses to close a bead whose assignee does not match BD_ACTOR, and its
+// own message suggests "--force" — a bd flag. gt mail archive has no --force,
+// so echoing bd verbatim turned a one-line failure into a dead end (hq-516).
+// Ownership mismatches are now reported with the two identities involved and
+// the bd command that resolves them.
+func formatArchiveError(msgID string, err error) string {
+	var notOwner *mail.NotOwnerError
+	if errors.As(err, &notOwner) {
+		return fmt.Sprintf("%s: assigned to %q but this session acts as %q\n"+
+			"    gt mail archive has no --force flag. Reassign, then retry:\n"+
+			"      bd update %s --assignee %s && gt mail archive %s",
+			msgID, notOwner.Assignee, notOwner.Actor, msgID, notOwner.Actor, msgID)
+	}
+	return fmt.Sprintf("%s: %v", msgID, err)
 }
 
 func staleMessagesForSession(messages []*mail.Message, sessionStart time.Time) []staleMessage {
