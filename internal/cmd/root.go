@@ -189,13 +189,26 @@ func isRoleCommand(cmd *cobra.Command) bool {
 	return false
 }
 
+// isDoneCommand reports whether cmd is the top-level `gt done` command, which
+// autosaves and pushes and therefore requires polecat worktree ownership.
+//
+// It must NOT match unrelated subcommands that merely end in a leaf named
+// "done" — `gt dog done`, `gt mol step done`, `gt wl done`. Those are run by
+// dogs, deacons, and the mayor, and an ancestor walk tripped the polecat
+// ownership guard in persistentPreRun before their RunE ever ran (gt-04p).
+// The practical fallout: molecule steps could never be closed by non-polecat
+// actors, so wisps never reached CLOSED and nothing reclaimed them.
+//
+// The root command's name is configurable (GT_COMMAND), so match on structure
+// rather than on a literal "gt done" command path: a command named "done"
+// whose parent is the root. A parentless "done" is treated as the real command
+// so the guard stays fail-closed for directly constructed commands.
 func isDoneCommand(cmd *cobra.Command) bool {
-	for c := cmd; c != nil; c = c.Parent() {
-		if c.Name() == "done" {
-			return true
-		}
+	if cmd == nil || cmd.Name() != "done" {
+		return false
 	}
-	return false
+	parent := cmd.Parent()
+	return parent == nil || parent.Parent() == nil
 }
 
 // initCLITheme initializes the CLI color theme based on settings and environment.

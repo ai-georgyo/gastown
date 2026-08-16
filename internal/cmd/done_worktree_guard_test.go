@@ -298,6 +298,77 @@ func TestIsDoneCommand(t *testing.T) {
 	}
 }
 
+// gt-04p: the polecat ownership guard must not fire for subcommands that merely
+// have a leaf named "done". Those are run by dogs, deacons, and the mayor, and
+// tripping the guard left molecule steps permanently open.
+func TestIsDoneCommandIgnoresNestedDoneSubcommands(t *testing.T) {
+	newRoot := func(name string) *cobra.Command { return &cobra.Command{Use: name} }
+
+	for _, tt := range []struct {
+		name     string
+		rootName string
+		path     []string
+	}{
+		{name: "gt dog done", rootName: "gt", path: []string{"dog", "done"}},
+		{name: "gt mol step done", rootName: "gt", path: []string{"mol", "step", "done"}},
+		{name: "gt wl done", rootName: "gt", path: []string{"wl", "done"}},
+		{name: "renamed root", rootName: "gtx", path: []string{"dog", "done"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			parent := newRoot(tt.rootName)
+			var leaf *cobra.Command
+			for _, name := range tt.path {
+				leaf = &cobra.Command{Use: name}
+				parent.AddCommand(leaf)
+				parent = leaf
+			}
+			if isDoneCommand(leaf) {
+				t.Fatalf("%s should not trip the gt done polecat guard", tt.name)
+			}
+		})
+	}
+}
+
+// The guard must still fire for the real top-level done, whatever the binary is
+// named (GT_COMMAND rewrites the root command's Use).
+func TestIsDoneCommandMatchesRenamedRoot(t *testing.T) {
+	root := &cobra.Command{Use: "gtx"}
+	done := &cobra.Command{Use: "done"}
+	root.AddCommand(done)
+	if !isDoneCommand(done) {
+		t.Fatal("top-level done should be detected under a renamed root")
+	}
+}
+
+// gt dog done must reach its own RunE instead of being rejected by the polecat
+// worktree guard while the caller is a dog.
+func TestPersistentPreRunAllowsNestedDoneForNonPolecatActor(t *testing.T) {
+	townRoot, _ := setupDoneGuardWorktree(t, "nested", "shiny")
+	t.Setenv("BD_ACTOR", "deacon/dogs/bravo")
+	t.Setenv("GT_ROLE", "deacon/dogs/bravo")
+	t.Setenv("GT_RIG", "")
+	t.Setenv("GT_POLECAT", "")
+
+	origDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(townRoot); err != nil {
+		t.Fatalf("chdir town root: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(origDir) })
+
+	root := &cobra.Command{Use: "gt"}
+	dog := &cobra.Command{Use: "dog"}
+	done := &cobra.Command{Use: "done"}
+	root.AddCommand(dog)
+	dog.AddCommand(done)
+
+	if err := persistentPreRun(done, nil); err != nil {
+		t.Fatalf("persistentPreRun(gt dog done) = %v, want nil", err)
+	}
+}
+
 func TestPersistentPreRunDoneRejectsBeforeRegistryFallback(t *testing.T) {
 	townRoot, _ := setupDoneGuardWorktree(t, "nested", "shiny")
 	initDoneGuardGitRepo(t, townRoot)
