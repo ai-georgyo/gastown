@@ -136,6 +136,16 @@ gt escalate ack <bead-id> [--note="Investigating"]
 gt escalate list [--severity=...] [--stale] [--unacked] [--all] [--json]
 ```
 
+One escalation writes several beads: the escalation record itself (an ephemeral
+wisp created by `CreateEscalationBead`) and one mail copy per routed target,
+each carrying `gt:message` and a `thread:<record id>` back-reference. The list
+shows one row per escalation — the record, or a mail copy when the record has
+already been reaped — so it agrees with `gt escalate show`.
+
+Because the records are wisps, the underlying `bd list` query must pass
+`--include-infra`; without it bd hides every record and the list can only see
+mail copies (gt-c6x).
+
 ### gt escalate stale
 
 Re-escalate stale (unacked past `stale_threshold`) escalations. Bumps severity
