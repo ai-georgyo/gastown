@@ -3889,6 +3889,68 @@ func (t *Tmux) SetTownCycleBindings(session string) error {
 	return t.SetCycleBindings(session)
 }
 
+// splitBindingLine parses one `tmux list-keys` output line of the form
+//
+//	bind-key [-r] -T <table> <key> <command...>
+//
+// It returns the key and the tmux command bound to it. ok is false when the
+// line is not a binding for the requested table.
+func splitBindingLine(line, table string) (key, command string, ok bool) {
+	var fields []string
+	var ends []int
+	for i := 0; i < len(line); {
+		for i < len(line) && (line[i] == ' ' || line[i] == '\t') {
+			i++
+		}
+		start := i
+		for i < len(line) && line[i] != ' ' && line[i] != '\t' {
+			i++
+		}
+		if start == i {
+			break
+		}
+		fields = append(fields, line[start:i])
+		ends = append(ends, i)
+	}
+	for j := 0; j+2 < len(fields); j++ {
+		if fields[j] == "-T" && fields[j+1] == table {
+			return unescapeBindingKey(fields[j+2]), strings.TrimSpace(line[ends[j+2]:]), true
+		}
+	}
+	return "", "", false
+}
+
+// unescapeBindingKey undoes the backslash escaping tmux applies to key names
+// with shell-special characters (it prints `"` as `\"`, `#` as `\#`, ...).
+func unescapeBindingKey(key string) string {
+	if len(key) == 2 && key[0] == '\\' {
+		return key[1:]
+	}
+	return key
+}
+
+// keyBinding returns the raw `list-keys` line for key in table along with the
+// tmux command bound to it. Both are empty when the key is unbound or the
+// query fails.
+//
+// It deliberately lists the whole table and selects the line itself rather than
+// using the single-key form `list-keys -T <table> <key>`: tmux 3.7 exits 0 with
+// no output for that form even when the key is bound, which silently broke
+// every binding probe below (gt-1su). Listing the table works on all versions.
+func (t *Tmux) keyBinding(table, key string) (line, command string) {
+	output, err := t.run("list-keys", "-T", table)
+	if err != nil {
+		return "", ""
+	}
+	for _, l := range strings.Split(output, "\n") {
+		k, cmd, ok := splitBindingLine(l, table)
+		if ok && k == key {
+			return l, cmd
+		}
+	}
+	return "", ""
+}
+
 // isGTBinding checks if the given key already has a Gas Town binding.
 // Used to skip redundant re-binding on repeated ConfigureGasTownSession /
 // EnsureBindingsOnSocket calls, preserving the user's original fallback.
@@ -3899,8 +3961,8 @@ func (t *Tmux) SetTownCycleBindings(session string) error {
 //  2. Unguarded form (set by EnsureBindingsOnSocket): direct run-shell
 //     invoking "gt agents menu" or "gt feed --window".
 func (t *Tmux) isGTBinding(table, key string) bool {
-	output, err := t.run("list-keys", "-T", table, key)
-	if err != nil || output == "" {
+	output, _ := t.keyBinding(table, key)
+	if output == "" {
 		return false
 	}
 	// Guarded form: if-shell + "gt ".
@@ -3917,8 +3979,8 @@ func (t *Tmux) isGTBinding(table, key string) bool {
 // --client for multi-client support. Older GT bindings without --client cause
 // switch-client to target the wrong client when multiple clients are attached.
 func (t *Tmux) isGTBindingWithClient(table, key string) bool {
-	output, err := t.run("list-keys", "-T", table, key)
-	if err != nil || output == "" {
+	output, _ := t.keyBinding(table, key)
+	if output == "" {
 		return false
 	}
 	return strings.Contains(output, "if-shell") && strings.Contains(output, "gt ") &&
@@ -3929,8 +3991,8 @@ func (t *Tmux) isGTBindingWithClient(table, key string) bool {
 // current prefix pattern. Returns false if the binding is stale (e.g., after
 // gt rig add introduces a new prefix not yet in the grep pattern).
 func (t *Tmux) isGTBindingCurrent(table, key, currentPattern string) bool {
-	output, err := t.run("list-keys", "-T", table, key)
-	if err != nil || output == "" {
+	output, _ := t.keyBinding(table, key)
+	if output == "" {
 		return false
 	}
 	return strings.Contains(output, currentPattern)
@@ -3948,16 +4010,8 @@ func (t *Tmux) isGTBindingCurrent(table, key, currentPattern string) bool {
 // the presence of both "if-shell" and "gt " in the output), it is treated as
 // no prior binding to avoid recursive wrapping on repeated calls.
 func (t *Tmux) getKeyBinding(table, key string) string {
-	// tmux list-keys -T <table> <key> outputs a line like:
-	//   bind-key -T prefix g if-shell "..." "run-shell 'gt agents menu'" ":"
-	// We need to extract just the command portion.
-	//
-	// Assumed format (tested with tmux 3.3+):
-	//   bind-key [-r] -T <table> <key> <command...>
-	// If tmux changes this format, parsing fails safely (returns ""),
-	// which causes the caller to use its default fallback.
-	output, err := t.run("list-keys", "-T", table, key)
-	if err != nil || output == "" {
+	output, cmd := t.keyBinding(table, key)
+	if output == "" {
 		return ""
 	}
 
@@ -3969,35 +4023,6 @@ func (t *Tmux) getKeyBinding(table, key string) string {
 	}
 	if strings.Contains(output, "gt agents menu") ||
 		strings.Contains(output, "gt feed --window") {
-		return ""
-	}
-
-	// Parse the binding command from list-keys output.
-	// Format: "bind-key [-r] -T <table> <key> <command...>"
-	// We need everything after the key name.
-	// Find the key in the output and take everything after it.
-	fields := strings.Fields(output)
-	keyIdx := -1
-	for i, f := range fields {
-		if f == "-T" && i+2 < len(fields) {
-			// Skip table name, the next field is the key
-			keyIdx = i + 2
-			break
-		}
-	}
-	if keyIdx < 0 || keyIdx >= len(fields)-1 {
-		return ""
-	}
-
-	// Everything after the key is the command
-	// Rejoin from keyIdx+1 onward, but we need to preserve the original spacing.
-	// Find the key token in the original string and take everything after it.
-	idx := strings.Index(output, " "+fields[keyIdx]+" ")
-	if idx < 0 {
-		return ""
-	}
-	cmd := strings.TrimSpace(output[idx+len(" "+fields[keyIdx]+" "):])
-	if cmd == "" {
 		return ""
 	}
 

@@ -15,6 +15,7 @@ func TestIsGTBindingCurrent_DetectsStalePattern(t *testing.T) {
 	session := "gt-test-stale-" + t.Name()
 	_ = tm.KillSession(session)
 	defer func() { _ = tm.KillSession(session) }()
+	defer restoreCycleKeyDefaults(tm)
 
 	if err := tm.NewSessionWithCommand(session, "", "sleep 30"); err != nil {
 		t.Fatalf("session creation: %v", err)
@@ -56,6 +57,7 @@ func TestSetCycleBindings_RefreshesStalePattern(t *testing.T) {
 	session := "gt-test-refresh-" + t.Name()
 	_ = tm.KillSession(session)
 	defer func() { _ = tm.KillSession(session) }()
+	defer restoreCycleKeyDefaults(tm)
 
 	if err := tm.NewSessionWithCommand(session, "", "sleep 30"); err != nil {
 		t.Fatalf("session creation: %v", err)
@@ -84,11 +86,106 @@ func TestSetCycleBindings_RefreshesStalePattern(t *testing.T) {
 
 	// Verify the binding was updated with the current pattern
 	currentPattern := sessionPrefixPattern()
-	output, err := tm.run("list-keys", "-T", "prefix", "n")
-	if err != nil {
-		t.Fatalf("listing keys: %v", err)
+	output, _ := tm.keyBinding("prefix", "n")
+	if output == "" {
+		t.Fatal("prefix-n has no binding after SetCycleBindings")
 	}
 	if !strings.Contains(output, currentPattern) {
 		t.Errorf("expected binding to contain current pattern %q, got: %s", currentPattern, output)
+	}
+}
+
+// restoreCycleKeyDefaults puts prefix n/p back to their stock tmux commands.
+// Tests in this package share one tmux server (see TestMain), so a test that
+// installs a GT cycle binding would otherwise leak it into later tests.
+func restoreCycleKeyDefaults(tm *Tmux) {
+	_, _ = tm.run("bind-key", "-T", "prefix", "n", "next-window")
+	_, _ = tm.run("bind-key", "-T", "prefix", "p", "previous-window")
+}
+
+// TestSplitBindingLine covers the `tmux list-keys` line parser that backs
+// keyBinding(). It exists because tmux 3.7 stopped honoring the single-key
+// form `list-keys -T <table> <key>` (it exits 0 with no output even when the
+// key is bound), so every binding probe now parses the whole-table listing
+// itself. These cases are real 3.7b output (gt-1su).
+func TestSplitBindingLine(t *testing.T) {
+	tests := []struct {
+		name        string
+		line        string
+		table       string
+		wantKey     string
+		wantCommand string
+		wantOK      bool
+	}{
+		{
+			name:        "plain binding",
+			line:        "bind-key    -T prefix n       next-window",
+			table:       "prefix",
+			wantKey:     "n",
+			wantCommand: "next-window",
+			wantOK:      true,
+		},
+		{
+			name:        "repeat flag before -T",
+			line:        "bind-key -r -T prefix Up      select-pane -U",
+			table:       "prefix",
+			wantKey:     "Up",
+			wantCommand: "select-pane -U",
+			wantOK:      true,
+		},
+		{
+			name:        "command with arguments keeps internal spacing",
+			line:        `bind-key    -T prefix $       command-prompt -I "#S" { rename-session "%%" }`,
+			table:       "prefix",
+			wantKey:     "$",
+			wantCommand: `command-prompt -I "#S" { rename-session "%%" }`,
+			wantOK:      true,
+		},
+		{
+			name:        "escaped key is unescaped",
+			line:        `bind-key    -T prefix \"      split-window`,
+			table:       "prefix",
+			wantKey:     `"`,
+			wantCommand: "split-window",
+			wantOK:      true,
+		},
+		{
+			name:        "bound key with no command",
+			line:        "bind-key    -T prefix F11",
+			table:       "prefix",
+			wantKey:     "F11",
+			wantCommand: "",
+			wantOK:      true,
+		},
+		{
+			name:   "different table is not matched",
+			line:   "bind-key    -T copy-mode n send-keys -X search-again",
+			table:  "prefix",
+			wantOK: false,
+		},
+		{
+			name:   "blank line",
+			line:   "",
+			table:  "prefix",
+			wantOK: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			key, command, ok := splitBindingLine(tt.line, tt.table)
+			if ok != tt.wantOK {
+				t.Fatalf("ok = %v, want %v", ok, tt.wantOK)
+			}
+			if !ok {
+				return
+			}
+			if key != tt.wantKey {
+				t.Errorf("key = %q, want %q", key, tt.wantKey)
+			}
+			if command != tt.wantCommand {
+				t.Errorf("command = %q, want %q", command, tt.wantCommand)
+			}
+		})
 	}
 }
