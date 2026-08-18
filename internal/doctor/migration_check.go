@@ -10,9 +10,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/steveyegge/gastown/internal/atomicfile"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/doltserver"
-	"github.com/steveyegge/gastown/internal/atomicfile"
 )
 
 var verifyExpectedDatabasesAtConfig = doltserver.VerifyExpectedDatabasesAtConfig
@@ -479,11 +479,14 @@ func (c *DoltServerReachableCheck) getServerAddr(beadsDir string, townRoot strin
 		host = "127.0.0.1"
 	}
 	if port == 0 {
-		// Use the same port resolution as Start/Stop/Status: config.yaml takes
-		// precedence over GT_DOLT_PORT env var, which takes precedence over
-		// daemon.json, which falls back to DefaultPort (3307). This ensures
-		// the doctor probes the same port that the server actually uses.
-		port = doltserver.DefaultConfig(townRoot).Port
+		// config.yaml takes precedence over the GT_DOLT_PORT env var, which
+		// takes precedence over daemon.json, which falls back to DefaultPort
+		// (3307). Gas Town starts Dolt with `sql-server --config config.yaml`,
+		// so config.yaml is what the running server actually listens on —
+		// while GT_DOLT_PORT is inherited by long-lived agent sessions and may
+		// be stale. Probing the env port first would report reachability
+		// against an endpoint the server does not serve (gt-1su).
+		port = config.ResolveConfiguredDoltPort(townRoot)
 	}
 	if port == 0 {
 		port = doltserver.DefaultPort

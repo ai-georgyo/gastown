@@ -2363,6 +2363,11 @@ func TestWaitForCatalog_NoServer(t *testing.T) {
 	if err := os.MkdirAll(dataDir, 0755); err != nil {
 		t.Fatal(err)
 	}
+	// ResolveDoltPort consults GT_DOLT_PORT before config.yaml, and agent
+	// sessions export it. Clear it, or this test connects to the real town
+	// server on 3307 and gets a retryable "database not found" instead of the
+	// connection failure it is asserting on (gt-1su).
+	t.Setenv("GT_DOLT_PORT", "")
 	// Write a config.yaml with an unreachable port so buildServerSQLCmd
 	// tries to connect to a port that nobody is listening on.
 	configContent := "listener:\n  port: 13399\ndata_dir: " + dataDir + "\n"
@@ -2914,7 +2919,10 @@ func TestFindBrokenWorkspaces_SqliteNotBroken(t *testing.T) {
 func TestFindBrokenWorkspaces_MultipleRigs(t *testing.T) {
 	townRoot := t.TempDir()
 
-	// Isolate from real Dolt server on default port
+	// Isolate from real Dolt server on default port. GT_DOLT_PORT is exported
+	// in agent sessions and beats config.yaml in ResolveDoltPort, so clearing
+	// it is what actually makes the config.yaml override below effective.
+	t.Setenv("GT_DOLT_PORT", "")
 	doltDataDir := filepath.Join(townRoot, ".dolt-data")
 	if err := os.MkdirAll(doltDataDir, 0755); err != nil {
 		t.Fatal(err)
@@ -2952,7 +2960,13 @@ func TestFindBrokenWorkspaces_MultipleRigs(t *testing.T) {
 		[]byte(`{"backend":"dolt","dolt_mode":"server","dolt_database":"rig-b"}`), 0644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.MkdirAll(filepath.Join(townRoot, ".dolt-data", "rig-b", ".dolt"), 0755); err != nil {
+	rigBNoms := filepath.Join(townRoot, ".dolt-data", "rig-b", ".dolt", "noms")
+	if err := os.MkdirAll(rigBNoms, 0755); err != nil {
+		t.Fatal(err)
+	}
+	// ListDatabases treats a .dolt/ dir without noms/manifest as a corrupted
+	// phantom database and skips it, which would make rig-b look broken.
+	if err := os.WriteFile(filepath.Join(rigBNoms, "manifest"), []byte(""), 0644); err != nil {
 		t.Fatal(err)
 	}
 
