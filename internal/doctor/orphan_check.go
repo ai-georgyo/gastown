@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/steveyegge/gastown/internal/events"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/tmux"
 )
@@ -17,7 +16,8 @@ import (
 type OrphanSessionCheck struct {
 	FixableCheck
 	sessionLister  SessionLister
-	orphanSessions []string // Cached during Run for use in Fix
+	terminator     sessionTerminator // nil means "use tmux" (injected in tests)
+	orphanSessions []string          // Cached during Run for use in Fix
 }
 
 // SessionLister abstracts tmux session listing for testing.
@@ -137,35 +137,26 @@ func (c *OrphanSessionCheck) Fix(ctx *CheckContext) error {
 		return nil
 	}
 
-	t := tmux.NewTmux()
+	term := c.terminator
+	if term == nil {
+		term = newTmuxTerminator()
+	}
 	var lastErr error
 
 	for _, sess := range c.orphanSessions {
-		// SAFEGUARD: Never auto-kill crew sessions.
-		// Crew workers are human-managed and require explicit action.
-		if isCrewSession(sess) {
+		// SAFEGUARD: never auto-kill a session the guard protects.
+		// Crew workers are human-managed and require explicit action, and a
+		// session we cannot classify is protected rather than destroyed.
+		if p := classifySessionForKill(sess); p.Protected {
+			fmt.Printf("  Not killing %s: %s\n", sess, p.Reason)
 			continue
 		}
-		// Log pre-death event for crash investigation (before killing)
-		_ = events.LogFeed(events.TypeSessionDeath, sess,
-			events.SessionDeathPayload(sess, "unknown", "orphan cleanup", "gt doctor"))
-		// Use KillSessionWithProcesses to ensure all descendant processes are killed.
-		if err := t.KillSessionWithProcesses(sess); err != nil {
+		if err := term.Kill(sess, "orphan cleanup"); err != nil {
 			lastErr = err
 		}
 	}
 
 	return lastErr
-}
-
-// isCrewSession returns true if the session name matches the crew pattern.
-// Crew sessions are gt-<rig>-crew-<name> and are protected from auto-cleanup.
-func isCrewSession(sess string) bool {
-	identity, err := session.ParseSessionName(sess)
-	if err != nil {
-		return false
-	}
-	return identity.Role == session.RoleCrew
 }
 
 // getValidRigs returns a list of valid rig names from the workspace.

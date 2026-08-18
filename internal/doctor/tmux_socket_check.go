@@ -135,6 +135,7 @@ func (c *SocketSplitBrainCheck) Run(ctx *CheckContext) *CheckResult {
 }
 
 // Fix kills Gas Town sessions on the "default" socket that shouldn't be there.
+// Crew sessions are never auto-killed — see crewProtection.
 func (c *SocketSplitBrainCheck) Fix(ctx *CheckContext) error {
 	if len(c.staleSessions) == 0 {
 		return nil
@@ -147,6 +148,13 @@ func (c *SocketSplitBrainCheck) Fix(ctx *CheckContext) error {
 	var lastErr error
 
 	for _, s := range c.staleSessions {
+		// SAFEGUARD: never auto-kill crew sessions. A crew session on the wrong
+		// socket is broken, but it is human-managed and may hold unsaved work;
+		// the human moves it, not us.
+		if p := crewProtection(s); p.Protected {
+			fmt.Printf("  Not killing %s: %s\n", s, p.Reason)
+			continue
+		}
 		if err := defaultLister.KillSessionWithProcesses(s); err != nil {
 			lastErr = err
 		}

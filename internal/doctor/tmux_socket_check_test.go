@@ -266,3 +266,31 @@ func TestSocketSplitBrainCheck_Fix_KillsStale(t *testing.T) {
 		t.Errorf("unexpected kill order: %v", mock.killed)
 	}
 }
+
+// TestSocketSplitBrainCheck_Fix_ProtectsCrew covers the gt-tdk audit: this fix
+// is a second doctor sweep that kills sessions selected by a heuristic, and it
+// had no crew guard at all.
+func TestSocketSplitBrainCheck_Fix_ProtectsCrew(t *testing.T) {
+	setupSocketTestRegistry(t)
+
+	check := NewSocketSplitBrainCheck()
+	check.staleSessions = []string{"ga-crew-joe", "ga-gastown-crew-joe", "ga-witness"}
+
+	mock := &mockSocketLister{}
+	check.defaultListerForTest = mock
+
+	if err := check.Fix(&CheckContext{TownRoot: t.TempDir()}); err != nil {
+		t.Fatalf("Fix() returned error: %v", err)
+	}
+
+	for _, protected := range []string{"ga-crew-joe", "ga-gastown-crew-joe"} {
+		for _, k := range mock.killed {
+			if k == protected {
+				t.Errorf("crew session %q was killed (killed: %v)", protected, mock.killed)
+			}
+		}
+	}
+	if len(mock.killed) != 1 || mock.killed[0] != "ga-witness" {
+		t.Errorf("expected only the witness session to be killed, got: %v", mock.killed)
+	}
+}

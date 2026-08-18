@@ -39,36 +39,45 @@ func TestZombieSessionCheck_Run_NoSessions(t *testing.T) {
 }
 
 func TestZombieSessionCheck_SkipsCrewSessions(t *testing.T) {
-	// Verify that crew sessions are not marked as zombies
-	check := NewZombieSessionCheck()
+	setupTestRegistry(t)
 
-	// Run the check - crew sessions should be skipped
-	ctx := &CheckContext{TownRoot: t.TempDir()}
-	result := check.Run(ctx)
+	// Crew sessions must never be reported as zombies, even when the liveness
+	// probe says no agent is running in them.
+	term := newFakeTerminator()
+	lister := &mockSessionLister{sessions: []string{"gt-crew-joe", "nif-crew-codex1"}}
+	check := NewZombieSessionCheckWithDeps(lister, term)
 
-	// If there are zombies, ensure no crew sessions are in the list
-	for _, detail := range result.Details {
-		if isCrewSession(detail) {
-			t.Errorf("crew session should not be in zombie list: %s", detail)
-		}
+	result := check.Run(&CheckContext{TownRoot: t.TempDir()})
+
+	if len(check.zombieSessions) != 0 {
+		t.Errorf("crew sessions were queued for cleanup: %v", check.zombieSessions)
+	}
+	if result.Status != StatusOK {
+		t.Errorf("expected StatusOK, got %v: %s", result.Status, result.Message)
 	}
 }
 
 func TestZombieSessionCheck_FixProtectsCrewSessions(t *testing.T) {
-	// Verify that Fix() never kills crew sessions
-	check := NewZombieSessionCheck()
+	setupTestRegistry(t)
 
-	// Manually set zombies including a crew session (simulating a bug)
+	term := newFakeTerminator()
+	check := NewZombieSessionCheckWithDeps(nil, term)
+
+	// Manually set zombies including a crew session (simulating a bug upstream
+	// in Run, which is exactly what the Fix-side safeguard exists to catch).
 	check.zombieSessions = []string{
-		"gt-gastown-crew-joe", // Should be skipped
-		"gt-gastown-witness",  // Would be killed (if real)
+		"gt-crew-joe", // Should be skipped
+		"gt-morsov",   // Ordinary polecat zombie - killed
 	}
 
-	ctx := &CheckContext{TownRoot: t.TempDir()}
+	if err := check.Fix(&CheckContext{TownRoot: t.TempDir()}); err != nil {
+		t.Fatalf("Fix returned error: %v", err)
+	}
 
-	// Fix should skip crew sessions due to safeguard
-	// (We can't fully test this without mocking tmux, but the safeguard is in place)
-	_ = check.Fix(ctx)
-
-	// The test passes if no panic occurred and crew sessions are protected by the safeguard
+	if term.wasKilled("gt-crew-joe") {
+		t.Errorf("crew session was killed (killed: %v)", term.killed)
+	}
+	if !term.wasKilled("gt-morsov") {
+		t.Errorf("ordinary zombie was not killed (killed: %v)", term.killed)
+	}
 }
