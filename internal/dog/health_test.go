@@ -276,6 +276,46 @@ func TestHealth_AutoClear_AgentDead(t *testing.T) {
 	}
 }
 
+// TestHealth_LivenessUnknown_NeverAutoClears is the gt-550 consequence measured
+// here rather than argued. Before the fix, a failed tmux query returned
+// SessionDead, so this exact path auto-cleared a working dog's work and killed
+// nothing it had verified was gone — and it would have done it to every dog at
+// once, because the failure is server-wide.
+func TestHealth_LivenessUnknown_NeverAutoClears(t *testing.T) {
+	m, _ := testManager(t)
+	now := time.Now()
+	setupDogWithState(t, m, "alpha", &DogState{
+		Name: "alpha", State: StateWorking, Work: "task-1",
+		WorkStartedAt: now.Add(-1 * time.Hour), LastActive: now,
+		CreatedAt: now, UpdatedAt: now,
+	})
+
+	mc := newMockChecker()
+	mc.healthResults["hq-dog-alpha"] = tmux.SessionUnknown
+	hc := NewHealthChecker(m, mc)
+
+	d, _ := m.Get("alpha")
+	r := hc.Check(d, 30*time.Minute, true) // autoClear ON — the dangerous setting
+
+	if r.AutoCleared {
+		t.Error("work was auto-cleared on an unknown liveness verdict")
+	}
+	if len(mc.killedSessions) != 0 {
+		t.Errorf("killedSessions = %v, want none on an unknown verdict", mc.killedSessions)
+	}
+	if !r.NeedsAttention {
+		t.Error("unknown liveness should be surfaced, not silently treated as healthy")
+	}
+	if r.SessionStatus != "liveness-unknown" {
+		t.Errorf("session_status = %q, want 'liveness-unknown'", r.SessionStatus)
+	}
+
+	d2, _ := m.Get("alpha")
+	if d2.State != StateWorking || d2.Work != "task-1" {
+		t.Errorf("dog = state %q work %q; work must survive an unknown verdict", d2.State, d2.Work)
+	}
+}
+
 // =============================================================================
 // Orphan sessions
 // =============================================================================
