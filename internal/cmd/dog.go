@@ -997,7 +997,10 @@ func runDogHealthCheck(cmd *cobra.Command, args []string) error {
 				line += " (auto-cleared)"
 			}
 			fmt.Println(line)
-			if r.Recommendation != "" && r.NeedsAttention {
+			if d := r.Liveness; d != nil {
+				fmt.Printf("    %s\n", formatLivenessDetail(d))
+			}
+			if r.Recommendation != "" {
 				fmt.Printf("    → %s\n", r.Recommendation)
 			}
 		}
@@ -1016,6 +1019,40 @@ func runDogHealthCheck(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
+}
+
+// formatLivenessDetail renders the raw signals behind a staleness verdict.
+//
+// activity, created and now are printed together on purpose: #{session_activity}
+// tracks client keystrokes, so printing the three side by side makes a frozen
+// field visible instead of leaving a reader to infer a hang from a number that is
+// really the session's age. attached is shown for the same reason — if the
+// verdicts split on it, the check is measuring attachment, not health (gt-0wz).
+func formatLivenessDetail(d *dog.LivenessDetail) string {
+	if d.ActivityError != "" {
+		return fmt.Sprintf("activity=unreadable (%s) now=%s", d.ActivityError, d.Now.Format(time.RFC3339))
+	}
+
+	// Never phrase this as the agent's idle time: it is keystroke age.
+	activity := "frozen at created (no client keystrokes ever)"
+	if d.ActivityAdvanced {
+		activity = fmt.Sprintf("last client keystroke %s ago", d.Now.Sub(d.Activity).Truncate(time.Second))
+	}
+
+	line := fmt.Sprintf("activity=%s created=%s now=%s attached=%t age=%s activity-field=%s",
+		d.Activity.Format(time.RFC3339),
+		d.Created.Format(time.RFC3339),
+		d.Now.Format(time.RFC3339),
+		d.Attached,
+		d.Now.Sub(d.Created).Truncate(time.Second),
+		activity,
+	)
+	if d.HeartbeatAge != "" {
+		line += fmt.Sprintf(" heartbeat=%s state=%s", d.HeartbeatAge, d.HeartbeatState)
+	} else {
+		line += " heartbeat=none"
+	}
+	return line
 }
 
 // runDogDispatch dispatches plugin execution to a dog worker.

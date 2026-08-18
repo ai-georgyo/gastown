@@ -959,7 +959,14 @@ func runDeaconHealthCheck(cmd *cobra.Command, args []string) error {
 			// Secondary signal: tmux session activity (prose/command response)
 			// Agents like the Witness respond to HEALTH_CHECK by running commands
 			// in their session, producing output, but may not update their bead.
-			// Session activity is a reliable liveness signal for these agents.
+			//
+			// This is a DIFFERENTIAL use — a baseline taken above, compared for
+			// change — which is the only sound way to read this field. tmux
+			// advances #{session_activity} on client interaction, not process
+			// output, so for the unattached sessions agents actually run in it
+			// never moves at all (gt-0wz). A frozen field therefore contributes
+			// nothing here rather than lying; do not promote this to a primary
+			// signal, and never threshold the field's absolute age.
 			if activityErr == nil {
 				newActivity, err := t.GetSessionActivity(sessionName)
 				if err == nil && newActivity.After(baselineActivity) {

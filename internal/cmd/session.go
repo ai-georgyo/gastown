@@ -286,6 +286,12 @@ func sessionHealthDetail(session string, status tmux.ZombieStatus, probeErr erro
 		return fmt.Sprintf("tmux session %q exists but no agent process was found in it", session)
 	case tmux.AgentHung:
 		return fmt.Sprintf("agent process in %q is alive but the session has been inactive past the threshold", session)
+	case tmux.AgentHangUnknown:
+		// #{session_activity} tracks client keystrokes, not agent output — 400
+		// lines of pane output move it in neither an attached nor an unattached
+		// session. Saying "hung" from it condemned every steadily-working agent
+		// in the town (gt-0wz); report what was and was not observed instead.
+		return fmt.Sprintf("agent process in %q is alive; idleness could not be determined because the only staleness signal (tmux session activity) tracks client keystrokes, not agent work", session)
 	case tmux.SessionUnknown:
 		if probeErr != nil {
 			return fmt.Sprintf("liveness could not be determined: %v", probeErr)

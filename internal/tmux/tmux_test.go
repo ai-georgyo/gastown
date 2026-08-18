@@ -2789,6 +2789,9 @@ func TestZombieStatusString(t *testing.T) {
 		{AgentDead, "agent-dead", true},
 		{AgentHung, "agent-hung", true},
 		{SessionUnknown, "liveness-unknown", false},
+		// Not a zombie: the agent is known alive, only its idleness is unknown.
+		// Callers reap zombies, and reaping on this was killing live agents (gt-0wz).
+		{AgentHangUnknown, "hang-unknown", false},
 	}
 
 	for _, tc := range tests {

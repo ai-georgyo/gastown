@@ -2355,19 +2355,99 @@ func (t *Tmux) GetPanePID(target string) (string, error) {
 	return result, nil
 }
 
-// GetSessionActivity returns the last activity time for a session.
-// This is updated whenever there's any activity in the session (input/output).
+// GetSessionActivity returns tmux's #{session_activity} for a session.
+//
+// Do NOT derive agent liveness from this value. #{session_activity} tracks
+// CLIENT KEYSTROKES — nothing else. Measured directly against this tmux (gt-0wz):
+//
+//	unattached session, 400 lines of pane output ...... activity did not move
+//	ATTACHED session, 400 lines of pane output ........ activity did not move
+//	attached session, one client keystroke ............ activity advanced
+//	programmatic send-keys ........................... activity did not move
+//
+// So the field says when a human last typed, not when the agent last did
+// anything. Across the town, 21 of 22 sessions had activity == created, and the
+// one that had advanced was the only session with a client attached — its
+// timestamp was seven hours old while the agent was actively working.
+//
+// Thresholding it therefore measures either session AGE (unattached) or time
+// since a human last typed (attached). Neither is a hang.
+//
+// A DIFFERENTIAL use — snapshot, act, look for a change — is still sound as a
+// secondary signal, because a field that never moves simply never fires.
+// GetSessionActivityDetail returns #{session_created} and #{session_attached}
+// alongside the value, for diagnostics that need to show why it is unusable.
 func (t *Tmux) GetSessionActivity(session string) (time.Time, error) {
-	out, err := t.run("display-message", "-t", session, "-p", "#{session_activity}")
+	act, err := t.GetSessionActivityDetail(session)
 	if err != nil {
 		return time.Time{}, err
 	}
+	return act.Activity, nil
+}
 
-	timestamp, err := strconv.ParseInt(strings.TrimSpace(out), 10, 64)
+// SessionActivity bundles the tmux fields a hang verdict needs. They are read in
+// a single display-message call so they describe the same instant: comparing an
+// activity timestamp from one call against a created timestamp from another
+// leaves a window in which the two disagree.
+type SessionActivity struct {
+	// Activity is #{session_activity}.
+	Activity time.Time
+	// Created is #{session_created}.
+	Created time.Time
+	// Attached reports whether a client is currently attached
+	// (#{session_attached}). It is the mechanism behind a frozen Activity, and
+	// is carried so diagnostics can show it rather than leaving a reader to
+	// infer it.
+	Attached bool
+}
+
+// Stale reports whether Activity is older than d. It is a fact about the
+// timestamp, deliberately not a verdict about the agent: see GetSessionActivity
+// for why a stale value does not mean a hang.
+func (a SessionActivity) Stale(d time.Duration) bool {
+	return !a.Activity.IsZero() && time.Since(a.Activity) > d
+}
+
+// Advanced reports whether #{session_activity} has moved since the session was
+// created, i.e. whether a client has ever typed into this session.
+//
+// It is a diagnostic, not a licence to threshold the field. False means the value
+// is literally the creation time, so its age is the session's age. True means
+// only that a keystroke landed at some point — the field still does not follow
+// agent output, so its age is time-since-a-human-typed. Neither supports a hang
+// verdict (gt-0wz).
+func (a SessionActivity) Advanced() bool {
+	return a.Activity.After(a.Created)
+}
+
+// GetSessionActivityDetail reads #{session_activity}, #{session_created} and
+// #{session_attached} for a session in one call.
+func (t *Tmux) GetSessionActivityDetail(session string) (SessionActivity, error) {
+	out, err := t.run("display-message", "-t", session, "-p",
+		"#{session_activity}|#{session_created}|#{session_attached}")
 	if err != nil {
-		return time.Time{}, fmt.Errorf("parsing session activity: %w", err)
+		return SessionActivity{}, err
 	}
-	return time.Unix(timestamp, 0), nil
+
+	fields := strings.Split(strings.TrimSpace(out), "|")
+	if len(fields) != 3 {
+		return SessionActivity{}, fmt.Errorf("parsing session activity for %q: want 3 fields, got %q", session, out)
+	}
+
+	activity, err := strconv.ParseInt(fields[0], 10, 64)
+	if err != nil {
+		return SessionActivity{}, fmt.Errorf("parsing session activity: %w", err)
+	}
+	created, err := strconv.ParseInt(fields[1], 10, 64)
+	if err != nil {
+		return SessionActivity{}, fmt.Errorf("parsing session created: %w", err)
+	}
+
+	return SessionActivity{
+		Activity: time.Unix(activity, 0),
+		Created:  time.Unix(created, 0),
+		Attached: strings.TrimSpace(fields[2]) == "1",
+	}, nil
 }
 
 // ZombieStatus describes the liveness state of a tmux agent session.
@@ -2393,6 +2473,21 @@ const (
 	//
 	// Declared last so the existing values keep their numbers.
 	SessionUnknown
+	// AgentHangUnknown means the session exists and the agent process is alive,
+	// but whether the agent is IDLE could not be determined, because the only
+	// staleness signal available — tmux #{session_activity} — tracks client
+	// keystrokes rather than agent activity (gt-0wz).
+	//
+	// It is deliberately not AgentHung. Asserting a hang from that field reported
+	// every steadily-working agent in the town as hung, and --auto-clear acts on
+	// the verdict by killing the session and clearing the agent's work. Levels 1
+	// and 2 did succeed here, so this is a narrower gap than SessionUnknown: the
+	// agent is known to be ALIVE, only the idleness refinement is unavailable.
+	//
+	// Detecting a real hang needs a signal the agent itself produces — a
+	// heartbeat, or pane-output change sampled over time. Callers with such a
+	// signal should consult it; see internal/dog.HealthChecker.
+	AgentHangUnknown
 )
 
 // String returns a human-readable label for the zombie status.
@@ -2408,6 +2503,8 @@ func (z ZombieStatus) String() string {
 		return "agent-hung"
 	case SessionUnknown:
 		return "liveness-unknown"
+	case AgentHangUnknown:
+		return "hang-unknown"
 	default:
 		return "unknown"
 	}
@@ -2415,6 +2512,9 @@ func (z ZombieStatus) String() string {
 
 // IsKnown reports whether the status is an observation rather than a failure to
 // observe. Callers that destroy state on a negative verdict must check this.
+// AgentHangUnknown is a known observation: session existence and agent process
+// liveness were both confirmed. Only the optional staleness refinement on top of
+// them could not be made.
 func (z ZombieStatus) IsKnown() bool {
 	return z != SessionUnknown
 }
@@ -2430,7 +2530,7 @@ func (z ZombieStatus) IsZombie() bool {
 type sessionHealthProber interface {
 	HasSession(name string) (bool, error)
 	IsAgentAliveChecked(session string) (bool, error)
-	GetSessionActivity(session string) (time.Time, error)
+	GetSessionActivityDetail(session string) (SessionActivity, error)
 }
 
 // CheckSessionHealth determines the health status of an agent session,
@@ -2487,15 +2587,41 @@ func checkSessionHealth(p sessionHealthProber, session string, maxInactivity tim
 		return AgentDead, nil
 	}
 
-	// Level 3: Has there been recent activity? (optional)
+	// Level 3: has the agent been idle past the threshold? (optional)
+	//
+	// This level can no longer answer that question, and now says so instead of
+	// guessing. Its only input is tmux #{session_activity}, and that field tracks
+	// CLIENT KEYSTROKES, not agent activity: measured against this tmux, 400 lines
+	// of pane output moved it in neither an unattached nor an attached session,
+	// while a single keystroke from an attached client moved it immediately
+	// (gt-0wz).
+	//
+	// So a stale value means one of two things, neither of them a hang:
+	//   - unattached (every Gas Town agent): the value IS #{session_created}, so
+	//     its age is the session's age. 21 of 22 town sessions were in this state,
+	//     and each one past the threshold was reported hung.
+	//   - attached: its age is the time since a human last typed. The town's one
+	//     attached session was seven hours "stale" while actively working.
+	//
+	// The verdict matters because callers act on it: dog health-check --auto-clear
+	// kills the session and clears the work. A real hang verdict needs a signal
+	// the agent produces itself; callers that have one consult it on top of this
+	// (internal/dog.HealthChecker uses heartbeats).
 	if maxInactivity > 0 {
-		lastActivity, err := p.GetSessionActivity(session)
-		if err == nil && !lastActivity.IsZero() {
-			if time.Since(lastActivity) > maxInactivity {
-				return AgentHung, nil
-			}
+		act, err := p.GetSessionActivityDetail(session)
+		switch {
+		case err != nil:
+			// Level 3 has always refused to answer on error rather than
+			// false-positive. Leave the level-1/2 verdict standing.
+
+		case !act.Stale(maxInactivity):
+			// Not stale even by this unusable measure, so there is nothing to
+			// report either way.
+
+		default:
+			// Stale — but staleness of this field is not idleness of the agent.
+			return AgentHangUnknown, nil
 		}
-		// On error or zero time, skip activity check — don't false-positive
 	}
 
 	return SessionHealthy, nil
