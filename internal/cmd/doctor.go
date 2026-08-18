@@ -201,6 +201,7 @@ func newDoctorForCommand(rig string) *doctor.Doctor {
 	// 3. dolt binary exists
 	// 4. Dolt server is reachable (everything downstream depends on this)
 	d.Register(doctor.NewStaleBinaryCheck())
+	d.Register(doctor.NewSupersededBinaryCheck())
 	d.Register(doctor.NewBeadsBinaryCheck())
 	d.Register(doctor.NewDoltBinaryCheck())
 	d.Register(doctor.NewClaudeBinaryCheck())

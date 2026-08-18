@@ -62,6 +62,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--json` report how many events were skipped. Also fixes a latent truncation
   in the same tail loop: a line the writer had not finished flushing was read
   and discarded rather than being carried to the next poll.
+- **A session running a superseded binary now says so** (gt-3pk) — installing gt
+  does not deploy it to processes that are already running, and nothing
+  re-execs a long-lived tmux session when a new build appears. With a
+  content-addressed install, the session's `$PATH` holds the *resolved store
+  path* of the build that was current when it started, and that entry shadows
+  the profile symlink upgrades follow — so `which gt` reports the pinned path
+  and is not evidence about what is deployed. Measured in a seven-rig town:
+  eleven merged fixes were correctly installed while 18 of 21 live gt processes
+  still executed the pre-rebuild binary, including every refinery, every
+  witness, the deacon and the mayor, and nothing surfaced it. `gt stale` and
+  `gt doctor` now compare three things — the running executable, what `$PATH`
+  resolves `gt` to, and the canonical install — and report which live gt
+  processes are on superseded code, by PID. `gt stale --json` gains
+  `superseded`, `path_shadowed`, `running_exe`, `path_exe` and `installed_exe`;
+  `safe_to_rebuild` is unchanged. Non-diagnostic commands print a one-line
+  warning, but only when `$PATH` handed this process the superseded binary, so
+  deliberately running a build output stays quiet. The `rebuild-gt` plugin now
+  drives the installed gt rather than `$PATH`: a stale session asking `gt stale`
+  got a superseded binary reporting on itself, answering "stale" after every
+  successful rebuild.
 
 ## [1.2.1] - 2026-06-06
 

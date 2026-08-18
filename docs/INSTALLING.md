@@ -378,6 +378,32 @@ stale shadow binary does not run the repair step first.
 If `command -v gt` points at a different install channel than the one you just
 updated, fix your PATH before continuing.
 
+### Installing is not deploying
+
+An update replaces the installed binary. It does not touch processes that are
+already running. Long-lived sessions — tmux agent sessions, the daemon — keep
+executing the binary they started with, and nothing re-execs them when a new
+one appears. So a correct update can still leave most of a town running
+superseded code.
+
+Content-addressed installs (Nix) make this worse. A session's PATH holds the
+*resolved store path* of the build that was current when it started, and that
+entry shadows the profile symlink that follows upgrades. `which gt` then
+reports the pinned store path, which is why it is not evidence about what is
+deployed. Only `/proc/<pid>/exe` and the install location are.
+
+`gt stale` and `gt doctor` both report this skew:
+
+```bash
+gt stale     # Running/PATH/Installed paths, plus live gt processes on old code
+gt doctor    # Same finding as the superseded-binary check
+```
+
+If either reports a superseded binary, **restart the affected sessions** —
+rebuilding again will not help. Until a session can be restarted, invoking the
+install location explicitly (`~/.nix-profile/bin/gt` or `~/.local/bin/gt`) runs
+the current code.
+
 ## Uninstalling
 
 ```bash
