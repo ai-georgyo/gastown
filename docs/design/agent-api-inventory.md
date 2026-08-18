@@ -447,17 +447,26 @@ returns allow/deny with reason
   Level 1: `HasSession()` (tmux session exists?),
   Level 2: `IsAgentAlive()` (agent process running?),
   Level 3: `GetSessionActivity()` (activity within maxInactivity?)
-- `internal/tmux/tmux.go` — `ZombieStatus` (line ~1723): enum with
-  `SessionHealthy`, `SessionDead`, `AgentDead`, `AgentHung`;
-  `IsZombie()` returns true for AgentDead or AgentHung
+- `internal/tmux/tmux.go` — `ZombieStatus`: enum with `SessionHealthy`,
+  `SessionDead`, `AgentDead`, `AgentHung`, `SessionUnknown`, `AgentHangUnknown`;
+  `IsZombie()` returns true for AgentDead or AgentHung only
 
 **Flow**: GT→GT (internal health assessment).
 
 **Fragility**:
 - HungSessionThreshold = 30 minutes (hardcoded default)
-- Activity timestamp from tmux `#{session_activity}` — measures any terminal
-  activity, not meaningful agent work
-- A sleeping agent with no output looks hung even if healthy
+- Activity timestamp from tmux `#{session_activity}` — this is weaker than
+  "any terminal activity". Probed directly (gt-0wz): 400 lines of pane output
+  moved the field in neither an unattached nor an attached session, and a single
+  keystroke from an attached client moved it immediately. It tracks **client
+  keystrokes**, so for the unattached sessions agents actually run in it stays
+  pinned at `#{session_created}` forever. 21 of 22 town sessions were in that
+  state; the one exception was the only attached session, and its timestamp was
+  seven hours old while the agent was actively working.
+- Consequently `#{session_activity}` no longer produces a hang verdict at all:
+  a stale value yields `AgentHangUnknown` ("hang-unknown"), which is not a
+  zombie and is never reaped. Real hang detection needs a signal the agent
+  produces itself — see §16, Heartbeat Files.
 
 **API mapping**: `GET /health` — agent reports status, context_usage, last_activity
 

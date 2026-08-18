@@ -4,19 +4,23 @@ import (
 	"testing"
 	"time"
 
+	"github.com/steveyegge/gastown/internal/polecat"
 	"github.com/steveyegge/gastown/internal/tmux"
 )
 
 // mockSessionChecker implements sessionChecker for testing.
 type mockSessionChecker struct {
-	healthResults  map[string]tmux.ZombieStatus // session -> status
-	sessionsAlive  map[string]bool              // session -> exists
+	healthResults  map[string]tmux.ZombieStatus    // session -> status
+	activity       map[string]tmux.SessionActivity // session -> tmux activity fields
+	activityErr    error
+	sessionsAlive  map[string]bool // session -> exists
 	killedSessions []string
 }
 
 func newMockChecker() *mockSessionChecker {
 	return &mockSessionChecker{
 		healthResults: make(map[string]tmux.ZombieStatus),
+		activity:      make(map[string]tmux.SessionActivity),
 		sessionsAlive: make(map[string]bool),
 	}
 }
@@ -26,6 +30,13 @@ func (m *mockSessionChecker) CheckSessionHealth(session string, _ time.Duration)
 		return s
 	}
 	return tmux.SessionDead
+}
+
+func (m *mockSessionChecker) GetSessionActivityDetail(session string) (tmux.SessionActivity, error) {
+	if m.activityErr != nil {
+		return tmux.SessionActivity{}, m.activityErr
+	}
+	return m.activity[session], nil
 }
 
 func (m *mockSessionChecker) HasSession(name string) (bool, error) {
@@ -449,5 +460,204 @@ func TestNeedsAttentionCount(t *testing.T) {
 
 	if got := NeedsAttentionCount(nil); got != 0 {
 		t.Errorf("NeedsAttentionCount(nil) = %d, want 0", got)
+	}
+}
+
+// =============================================================================
+// gt-0wz: session_activity is not a liveness signal for unattached sessions
+// =============================================================================
+
+// TestHealth_HangUnknown_IsNotReaped is the destructive half of gt-0wz. tmux only
+// advances #{session_activity} on client interaction, so for the unattached
+// sessions agents actually run in the field stays pinned at session creation and
+// every dog working longer than --max-inactivity was reported hung. With
+// --auto-clear that verdict kills the session and clears the work, so a single
+// health-check run would have reaped the whole kennel.
+func TestHealth_HangUnknown_IsNotReaped(t *testing.T) {
+	m, _ := testManager(t)
+	now := time.Now()
+	setupDogWithState(t, m, "alpha", &DogState{
+		Name: "alpha", State: StateWorking, Work: "task-1",
+		WorkStartedAt: now.Add(-2 * time.Hour), LastActive: now,
+		CreatedAt: now, UpdatedAt: now,
+	})
+
+	mc := newMockChecker()
+	mc.healthResults["hq-dog-alpha"] = tmux.AgentHangUnknown
+	hc := NewHealthChecker(m, mc)
+
+	d, _ := m.Get("alpha")
+	r := hc.Check(d, 30*time.Minute, true) // autoClear on: the dangerous path
+
+	if r.AutoCleared {
+		t.Error("work was cleared on an undetermined hang; the agent is known alive")
+	}
+	if len(mc.killedSessions) != 0 {
+		t.Errorf("killedSessions = %v, want none — killing a live agent's session", mc.killedSessions)
+	}
+	if r.NeedsAttention {
+		t.Error("an undetermined hang demanded attention; every unattached agent trips this")
+	}
+	if r.SessionStatus != "hang-unknown" {
+		t.Errorf("session_status = %q, want 'hang-unknown'", r.SessionStatus)
+	}
+}
+
+// TestHealth_FreshHeartbeatOverridesStaleActivity covers the other shape the tmux
+// layer cannot fix on its own: a session whose activity field does advance but
+// lags far behind the work the agent is doing — the state the mayor's session was
+// in, 417 minutes "stale" while actively running commands.
+//
+// A heartbeat is written by the agent itself, so it does not depend on a client
+// being attached. The witness already prefers it over activity scraping (gt-3vr5).
+func TestHealth_FreshHeartbeatOverridesStaleActivity(t *testing.T) {
+	m, _ := testManager(t)
+	now := time.Now()
+	setupDogWithState(t, m, "alpha", &DogState{
+		Name: "alpha", State: StateWorking, Work: "task-1",
+		WorkStartedAt: now.Add(-2 * time.Hour), LastActive: now,
+		CreatedAt: now, UpdatedAt: now,
+	})
+
+	mc := newMockChecker()
+	mc.healthResults["hq-dog-alpha"] = tmux.AgentHung
+	hc := NewHealthChecker(m, mc)
+	hc.heartbeat = func(string) *polecat.SessionHeartbeat {
+		return &polecat.SessionHeartbeat{Timestamp: now, State: polecat.HeartbeatWorking}
+	}
+
+	d, _ := m.Get("alpha")
+	r := hc.Check(d, 30*time.Minute, true)
+
+	if r.SessionStatus != "healthy" {
+		t.Errorf("session_status = %q, want 'healthy' — the agent reported in seconds ago", r.SessionStatus)
+	}
+	if r.AutoCleared || len(mc.killedSessions) != 0 {
+		t.Error("a dog with a fresh heartbeat was reaped")
+	}
+}
+
+// TestHealth_StaleHeartbeatLeavesHangVerdictStanding guards against the override
+// swallowing real hangs. A heartbeat older than the stale threshold is no
+// evidence of life, so the tmux verdict must stand.
+func TestHealth_StaleHeartbeatLeavesHangVerdictStanding(t *testing.T) {
+	m, _ := testManager(t)
+	now := time.Now()
+	setupDogWithState(t, m, "alpha", &DogState{
+		Name: "alpha", State: StateWorking, Work: "task-1",
+		WorkStartedAt: now.Add(-2 * time.Hour), LastActive: now,
+		CreatedAt: now, UpdatedAt: now,
+	})
+
+	mc := newMockChecker()
+	mc.healthResults["hq-dog-alpha"] = tmux.AgentHung
+	hc := NewHealthChecker(m, mc)
+	hc.heartbeat = func(string) *polecat.SessionHeartbeat {
+		return &polecat.SessionHeartbeat{
+			Timestamp: now.Add(-2 * polecat.SessionHeartbeatStaleThreshold),
+			State:     polecat.HeartbeatWorking,
+		}
+	}
+
+	d, _ := m.Get("alpha")
+	r := hc.Check(d, 30*time.Minute, false)
+
+	if r.SessionStatus != "agent-hung" {
+		t.Errorf("session_status = %q, want 'agent-hung'", r.SessionStatus)
+	}
+	if !r.NeedsAttention {
+		t.Error("a genuine hang stopped needing attention")
+	}
+}
+
+// TestHealth_SelfReportedStuckIsFlaggedNotReaped: an agent that says it is stuck
+// is still running, so killing its session destroys live work. Flag it and let
+// the Deacon decide, per ZFC.
+func TestHealth_SelfReportedStuckIsFlaggedNotReaped(t *testing.T) {
+	m, _ := testManager(t)
+	now := time.Now()
+	setupDogWithState(t, m, "alpha", &DogState{
+		Name: "alpha", State: StateWorking, Work: "task-1",
+		WorkStartedAt: now.Add(-2 * time.Hour), LastActive: now,
+		CreatedAt: now, UpdatedAt: now,
+	})
+
+	mc := newMockChecker()
+	mc.healthResults["hq-dog-alpha"] = tmux.AgentHung
+	hc := NewHealthChecker(m, mc)
+	hc.heartbeat = func(string) *polecat.SessionHeartbeat {
+		return &polecat.SessionHeartbeat{Timestamp: now, State: polecat.HeartbeatStuck}
+	}
+
+	d, _ := m.Get("alpha")
+	r := hc.Check(d, 30*time.Minute, true)
+
+	if !r.NeedsAttention {
+		t.Error("a self-reported stuck dog should need attention")
+	}
+	if r.AutoCleared || len(mc.killedSessions) != 0 {
+		t.Error("a live agent's session was killed on its own stuck report")
+	}
+}
+
+// TestHealth_LivenessDetailIsReported covers the diagnostic requirement: the raw
+// signals must be printed beside the verdict so a future freeze is visible rather
+// than inferred, including whether a client was attached.
+func TestHealth_LivenessDetailIsReported(t *testing.T) {
+	m, _ := testManager(t)
+	now := time.Now()
+	setupDogWithState(t, m, "alpha", &DogState{
+		Name: "alpha", State: StateWorking, Work: "task-1",
+		WorkStartedAt: now.Add(-2 * time.Hour), LastActive: now,
+		CreatedAt: now, UpdatedAt: now,
+	})
+
+	created := now.Add(-48 * time.Hour)
+	mc := newMockChecker()
+	mc.healthResults["hq-dog-alpha"] = tmux.AgentHangUnknown
+	mc.activity["hq-dog-alpha"] = tmux.SessionActivity{
+		Activity: created, Created: created, Attached: false,
+	}
+	hc := NewHealthChecker(m, mc)
+
+	d, _ := m.Get("alpha")
+	r := hc.Check(d, 30*time.Minute, false)
+
+	if r.Liveness == nil {
+		t.Fatal("Liveness detail missing; a frozen activity field would be invisible")
+	}
+	if !r.Liveness.Activity.Equal(created) || !r.Liveness.Created.Equal(created) {
+		t.Errorf("Liveness activity/created = %v/%v, want both %v",
+			r.Liveness.Activity, r.Liveness.Created, created)
+	}
+	if r.Liveness.ActivityAdvanced {
+		t.Error("ActivityAdvanced = true for a field pinned at session creation")
+	}
+	if r.Liveness.Attached {
+		t.Error("Attached = true for an unattached session")
+	}
+	if r.Liveness.Now.IsZero() {
+		t.Error("Now is zero; the reader cannot tell how old the timestamps are")
+	}
+}
+
+// TestHealth_NoLivenessDetailWithoutThreshold: callers that pass 0 skip the
+// staleness level entirely, so there is nothing to explain.
+func TestHealth_NoLivenessDetailWithoutThreshold(t *testing.T) {
+	m, _ := testManager(t)
+	now := time.Now()
+	setupDogWithState(t, m, "alpha", &DogState{
+		Name: "alpha", State: StateWorking, Work: "task-1",
+		WorkStartedAt: now.Add(-2 * time.Hour), LastActive: now,
+		CreatedAt: now, UpdatedAt: now,
+	})
+
+	mc := newMockChecker()
+	mc.healthResults["hq-dog-alpha"] = tmux.SessionHealthy
+	hc := NewHealthChecker(m, mc)
+
+	d, _ := m.Get("alpha")
+	if r := hc.Check(d, 0, false); r.Liveness != nil {
+		t.Error("Liveness populated when no inactivity threshold was in play")
 	}
 }

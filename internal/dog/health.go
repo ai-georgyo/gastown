@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/steveyegge/gastown/internal/polecat"
 	"github.com/steveyegge/gastown/internal/tmux"
 )
 
@@ -11,30 +12,77 @@ import (
 // health checker.  Satisfied by *tmux.Tmux; mockable in tests.
 type sessionChecker interface {
 	CheckSessionHealth(session string, maxInactivity time.Duration) tmux.ZombieStatus
+	GetSessionActivityDetail(session string) (tmux.SessionActivity, error)
 	HasSession(name string) (bool, error)
 	KillSession(name string) error
+}
+
+// heartbeatReader reads an agent's self-reported heartbeat. Split out so the
+// override can be tested without a filesystem.
+type heartbeatReader func(sessionName string) *polecat.SessionHeartbeat
+
+// LivenessDetail records the raw signals behind a session verdict so a reader can
+// see why it was reached instead of inferring it (gt-0wz).
+//
+// The three timestamps are reported together deliberately. #{session_activity}
+// tracks client keystrokes, so for the unattached sessions agents run in it never
+// moves at all; printing it beside Created and Now makes that visible —
+// Activity == Created on a session hours old is the signature.
+type LivenessDetail struct {
+	// Activity is tmux #{session_activity}.
+	Activity time.Time `json:"activity"`
+	// Created is tmux #{session_created}.
+	Created time.Time `json:"created"`
+	// Now is when the check ran.
+	Now time.Time `json:"now"`
+	// Attached reports whether a client is attached. If the check's verdicts
+	// split on this field, it is measuring attachment rather than health.
+	Attached bool `json:"attached"`
+	// ActivityAdvanced reports whether Activity ever moved past Created, i.e.
+	// whether a client has ever typed into this session. When false, Activity's
+	// age is the session's age; when true it is the time since a human typed.
+	// Neither is the agent's idle time.
+	ActivityAdvanced bool `json:"activity_advanced"`
+	// ActivityError is set when the tmux fields could not be read.
+	ActivityError string `json:"activity_error,omitempty"`
+	// HeartbeatAge is how long ago the agent last wrote a heartbeat. Empty when
+	// no heartbeat file exists.
+	HeartbeatAge string `json:"heartbeat_age,omitempty"`
+	// HeartbeatState is the agent's self-reported state (heartbeat v2, gt-3vr5).
+	HeartbeatState string `json:"heartbeat_state,omitempty"`
 }
 
 // DogHealthResult describes the health of a single dog.
 type DogHealthResult struct {
 	Name           string        `json:"name"`
 	State          State         `json:"state"`
-	SessionStatus  string        `json:"session_status"`           // from ZombieStatus.String()
-	WorkDuration   time.Duration `json:"work_duration,omitempty"`  // how long current work has been running
+	SessionStatus  string        `json:"session_status"`          // from ZombieStatus.String()
+	WorkDuration   time.Duration `json:"work_duration,omitempty"` // how long current work has been running
 	NeedsAttention bool          `json:"needs_attention"`
 	AutoCleared    bool          `json:"auto_cleared,omitempty"`
 	Recommendation string        `json:"recommendation,omitempty"`
+	// Liveness carries the raw signals behind SessionStatus. Populated whenever
+	// an inactivity threshold was in play, which is when they can mislead.
+	Liveness *LivenessDetail `json:"liveness,omitempty"`
 }
 
 // HealthChecker performs health checks on dogs in the kennel.
 type HealthChecker struct {
-	mgr     *Manager
-	checker sessionChecker
+	mgr       *Manager
+	checker   sessionChecker
+	heartbeat heartbeatReader
 }
 
 // NewHealthChecker creates a HealthChecker.
 func NewHealthChecker(mgr *Manager, checker sessionChecker) *HealthChecker {
-	return &HealthChecker{mgr: mgr, checker: checker}
+	townRoot := mgr.TownRoot()
+	return &HealthChecker{
+		mgr:     mgr,
+		checker: checker,
+		heartbeat: func(sessionName string) *polecat.SessionHeartbeat {
+			return polecat.ReadSessionHeartbeat(townRoot, sessionName)
+		},
+	}
 }
 
 // dogSessionName returns the tmux session name for a dog.
@@ -59,6 +107,20 @@ func (hc *HealthChecker) Check(d *Dog, maxInactivity time.Duration, autoClear bo
 	switch d.State {
 	case StateWorking:
 		status := hc.checker.CheckSessionHealth(session, maxInactivity)
+
+		// Record the raw signals and, where a hang was suspected, give the agent
+		// a chance to speak for itself before the verdict stands (gt-0wz).
+		// The heartbeat is read once and shared, so the reported detail and the
+		// verdict cannot disagree about it.
+		if maxInactivity > 0 {
+			var hb *polecat.SessionHeartbeat
+			if hc.heartbeat != nil {
+				hb = hc.heartbeat(session)
+			}
+			result.Liveness = hc.livenessDetail(session, hb)
+			status = hc.reconsiderHang(status, hb, &result)
+		}
+
 		result.SessionStatus = status.String()
 
 		switch status {
@@ -102,6 +164,21 @@ func (hc *HealthChecker) Check(d *Dog, maxInactivity time.Duration, autoClear bo
 				result.Recommendation = "hung: agent alive but no tmux activity"
 			}
 
+		case tmux.AgentHangUnknown:
+			// Session and agent process are both confirmed alive; only idleness
+			// was undeterminable, because tmux #{session_activity} tracks client
+			// keystrokes rather than agent activity. That is not evidence of a
+			// hang, and auto-clearing on it killed steadily-working dogs
+			// (gt-0wz). Report it without demanding attention or reaping.
+			//
+			// A dog that really has stopped shows up as a stale heartbeat here,
+			// which reconsiderHang deliberately does not promote to a hang
+			// either: a heartbeat advances on gt invocations, so a long non-gt
+			// step looks identical. Until a signal that follows agent activity
+			// exists, "cannot determine" is the honest answer, and it is the
+			// safe one — the failure mode of guessing was killing live agents.
+			result.Recommendation = "hang undetermined: agent process alive, tmux activity tracks client keystrokes not agent work - not clearing work"
+
 		case tmux.SessionUnknown:
 			// A probe failed, so nothing was observed. Flag it, but do not
 			// auto-clear: clearing work on an unknown verdict is how a single
@@ -131,6 +208,66 @@ func (hc *HealthChecker) Check(d *Dog, maxInactivity time.Duration, autoClear bo
 	}
 
 	return result
+}
+
+// livenessDetail reads the signals behind a staleness verdict. It never fails:
+// an unreadable probe is reported in the struct rather than dropped, because the
+// point of these fields is to make a broken signal visible.
+func (hc *HealthChecker) livenessDetail(session string, hb *polecat.SessionHeartbeat) *LivenessDetail {
+	d := &LivenessDetail{Now: time.Now()}
+
+	act, err := hc.checker.GetSessionActivityDetail(session)
+	if err != nil {
+		d.ActivityError = err.Error()
+	} else {
+		d.Activity = act.Activity
+		d.Created = act.Created
+		d.Attached = act.Attached
+		d.ActivityAdvanced = act.Advanced()
+	}
+
+	if hb != nil {
+		d.HeartbeatAge = time.Since(hb.Timestamp).Truncate(time.Second).String()
+		d.HeartbeatState = string(hb.EffectiveState())
+	}
+
+	return d
+}
+
+// reconsiderHang upgrades an undetermined or hung verdict to healthy when the
+// agent has written a fresh heartbeat.
+//
+// A heartbeat is a signal the agent produces itself, so unlike
+// #{session_activity} it does not depend on a client typing. The witness already
+// prefers it over activity scraping for the same reason (gt-3vr5), and dogs write
+// one on every gt invocation.
+//
+// It only ever overrides toward alive. A stale heartbeat is not treated as proof
+// of a hang, because a heartbeat advances on gt invocations rather than
+// continuously, and a long non-gt step is normal.
+func (hc *HealthChecker) reconsiderHang(status tmux.ZombieStatus, hb *polecat.SessionHeartbeat, result *DogHealthResult) tmux.ZombieStatus {
+	if status != tmux.AgentHung && status != tmux.AgentHangUnknown {
+		return status
+	}
+	if hb == nil || time.Since(hb.Timestamp) >= polecat.SessionHeartbeatStaleThreshold {
+		return status
+	}
+
+	// The agent reported in recently, so it is alive whatever tmux thinks.
+	age := time.Since(hb.Timestamp).Truncate(time.Second).String()
+
+	if hb.EffectiveState() == polecat.HeartbeatStuck {
+		// A self-report is a real signal and worth surfacing, but it is not a
+		// hang inferred from a timestamp — and it must not enter the reaping
+		// path, which kills the session out from under a live agent. Flag it and
+		// let the Deacon decide, per ZFC.
+		result.NeedsAttention = true
+		result.Recommendation = fmt.Sprintf("agent self-reports stuck (heartbeat %s) - alive, not reaped", age)
+		return tmux.SessionHealthy
+	}
+
+	result.Recommendation = fmt.Sprintf("fresh heartbeat (%s, state=%s) overrides stale tmux activity", age, hb.EffectiveState())
+	return tmux.SessionHealthy
 }
 
 // CheckAll performs health checks on all dogs.

@@ -105,11 +105,19 @@ func (m *Manager) IsRunning() (bool, error) {
 	return status == tmux.SessionHealthy, nil
 }
 
-// IsHealthy checks if the refinery is running and has been active recently.
-// Unlike IsRunning which only checks process liveness, this also detects hung
-// sessions where Claude is alive but hasn't produced output in maxInactivity.
-// Returns the detailed ZombieStatus for callers that need to distinguish
-// between different failure modes.
+// IsHealthy checks if the refinery is running, and additionally consults tmux
+// activity.
+//
+// It CANNOT detect a hung agent, despite what this comment used to claim.
+// maxInactivity is compared against tmux #{session_activity}, and that field
+// tracks client keystrokes rather than agent output — 400 lines of pane output
+// move it in neither an attached nor an unattached session (gt-0wz). So a stale
+// value yields AgentHangUnknown, meaning "the agent is alive but its idleness is
+// undeterminable", never AgentHung.
+//
+// Returns the detailed ZombieStatus. A caller wiring this up to reap or restart
+// sessions needs an agent-produced signal (a heartbeat) instead; see
+// internal/dog.HealthChecker for the shape that works.
 func (m *Manager) IsHealthy(maxInactivity time.Duration) tmux.ZombieStatus {
 	t := tmux.NewTmux()
 	return t.CheckSessionHealth(m.SessionName(), maxInactivity)

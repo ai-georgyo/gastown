@@ -43,6 +43,13 @@ func NewManager(townRoot string, rigsConfig *config.RigsConfig) *Manager {
 	}
 }
 
+// TownRoot returns the town root this kennel lives under. The health checker
+// needs it to read agent heartbeats, which are the sound liveness signal that
+// tmux's #{session_activity} is not (gt-0wz).
+func (m *Manager) TownRoot() string {
+	return m.townRoot
+}
+
 // lockDog acquires an exclusive file lock for a specific dog's state operations.
 // This prevents concurrent load-modify-save races on .dog.json.
 // Caller must defer fl.Unlock().
