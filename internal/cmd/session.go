@@ -175,18 +175,28 @@ var sessionHealthCmd = &cobra.Command{
 	Short: "Check a tmux agent session with central runtime liveness",
 	Long: `Check a tmux agent session using the central runtime-aware liveness path.
 
-This wraps tmux.CheckSessionHealth, which reads GT_PROCESS_NAMES/GT_AGENT from
-the session environment before falling back to built-in agent process names.
+This wraps tmux.CheckSessionHealthChecked, which reads GT_PROCESS_NAMES/GT_AGENT
+from the session environment before falling back to built-in agent process names.
+
+The argument is a tmux session name (gt-vault), not an agent address
+(gastown/vault). Given an address, no session answers to that name and the
+status is session-dead — a fact about the name you passed, not about any agent.
+The detail field says so.
 
 The command exits successfully for all valid health states; inspect the status
 field when using --json. Operational failures, argument errors, or invalid flags
-return non-zero.
+return non-zero. A failed liveness probe is an operational failure: the status is
+liveness-unknown, liveness_known is false, and the exit code is non-zero. It is
+never reported as a death state.
 
 Examples:
   gt session health gt-vault --json
   gt session health gt-vault --json --max-inactivity 30m`,
 	Args: cobra.ExactArgs(1),
 	RunE: runSessionHealth,
+	// A failed probe is a runtime failure, not a usage mistake; printing the
+	// usage block under it buries the reason liveness is unknown.
+	SilenceUsage: true,
 }
 
 func init() {
@@ -233,20 +243,56 @@ func init() {
 }
 
 type sessionHealthReport struct {
-	Session              string `json:"session"`
-	Status               string `json:"status"`
-	Healthy              bool   `json:"healthy"`
-	Zombie               bool   `json:"zombie"`
+	Session string `json:"session"`
+	Status  string `json:"status"`
+	Healthy bool   `json:"healthy"`
+	Zombie  bool   `json:"zombie"`
+	// Known is false when a probe failed and nothing was observed. A caller
+	// reading only Status/Healthy sees a negative either way; this is how it
+	// tells "the agent is not alive" from "I could not find out".
+	Known bool `json:"liveness_known"`
+	// Detail says what the status means for this specific session. "session-dead"
+	// is the status for a name no tmux session answers to, which reads as a dead
+	// agent and is not one; saying so here is what stops that misreading.
+	Detail               string `json:"detail,omitempty"`
 	MaxInactivitySeconds int64  `json:"max_inactivity_seconds"`
 }
 
 func newSessionHealthReport(session string, status tmux.ZombieStatus, maxInactivity time.Duration) sessionHealthReport {
+	return newSessionHealthReportChecked(session, status, maxInactivity, nil)
+}
+
+func newSessionHealthReportChecked(session string, status tmux.ZombieStatus, maxInactivity time.Duration, probeErr error) sessionHealthReport {
 	return sessionHealthReport{
 		Session:              session,
 		Status:               status.String(),
 		Healthy:              status == tmux.SessionHealthy,
 		Zombie:               status.IsZombie(),
+		Known:                status.IsKnown(),
+		Detail:               sessionHealthDetail(session, status, probeErr),
 		MaxInactivitySeconds: int64(maxInactivity.Seconds()),
+	}
+}
+
+// sessionHealthDetail explains a status in terms of what was actually observed.
+func sessionHealthDetail(session string, status tmux.ZombieStatus, probeErr error) string {
+	switch status {
+	case tmux.SessionDead:
+		// This command takes a tmux session name, not an agent address. Given
+		// an address it correctly reports that no session answers to that name,
+		// and callers have read that as "the agent died" (gt-550).
+		return fmt.Sprintf("no tmux session named %q exists; this is not a report about an agent process", session)
+	case tmux.AgentDead:
+		return fmt.Sprintf("tmux session %q exists but no agent process was found in it", session)
+	case tmux.AgentHung:
+		return fmt.Sprintf("agent process in %q is alive but the session has been inactive past the threshold", session)
+	case tmux.SessionUnknown:
+		if probeErr != nil {
+			return fmt.Sprintf("liveness could not be determined: %v", probeErr)
+		}
+		return "liveness could not be determined"
+	default:
+		return ""
 	}
 }
 
@@ -652,19 +698,26 @@ func runSessionStatus(cmd *cobra.Command, args []string) error {
 
 func runSessionHealth(cmd *cobra.Command, args []string) error {
 	sessionName := args[0]
-	status := tmux.NewTmux().CheckSessionHealth(sessionName, sessionHealthMaxInactivity)
-	report := newSessionHealthReport(sessionName, status, sessionHealthMaxInactivity)
+	// Checked form: a failed probe is an operational failure, which this
+	// command's own help says returns non-zero. Reporting it as a health state
+	// is what let one unreachable tmux server look like a town of dead agents.
+	status, probeErr := tmux.NewTmux().CheckSessionHealthChecked(sessionName, sessionHealthMaxInactivity)
+	report := newSessionHealthReportChecked(sessionName, status, sessionHealthMaxInactivity, probeErr)
 
 	if sessionHealthJSON {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
-		return enc.Encode(report)
-	}
-
-	if report.Healthy {
+		if err := enc.Encode(report); err != nil {
+			return err
+		}
+	} else if report.Healthy {
 		fmt.Printf("%s: %s\n", sessionName, style.Bold.Render(report.Status))
 	} else {
-		fmt.Printf("%s: %s\n", sessionName, style.Dim.Render(report.Status))
+		fmt.Printf("%s: %s (%s)\n", sessionName, style.Dim.Render(report.Status), report.Detail)
+	}
+
+	if probeErr != nil {
+		return fmt.Errorf("checking session health: %w", probeErr)
 	}
 	return nil
 }

@@ -2,8 +2,10 @@ package cmd
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -106,6 +108,104 @@ func TestSessionHealthReportJSONContract(t *testing.T) {
 	}
 	if parsed["max_inactivity_seconds"] != float64(1800) {
 		t.Errorf("max_inactivity_seconds = %v, want 1800", parsed["max_inactivity_seconds"])
+	}
+}
+
+// TestSessionHealthReport_UnknownIsNotADeathReport pins the caller-facing half
+// of gt-550. A report whose only negative signals are healthy=false and
+// zombie=false looks exactly like a session-dead report, so the JSON must carry
+// the distinction between "not alive" and "could not find out".
+func TestSessionHealthReport_UnknownIsNotADeathReport(t *testing.T) {
+	probeErr := errors.New("tmux server unreachable")
+	report := newSessionHealthReportChecked("gt-vault", tmux.SessionUnknown, 0, probeErr)
+
+	if report.Status == tmux.SessionDead.String() || report.Status == tmux.AgentDead.String() {
+		t.Fatalf("status = %q; a failed probe must not be reported as a death state", report.Status)
+	}
+	if report.Known {
+		t.Error("liveness_known = true for a failed probe")
+	}
+	if report.Healthy || report.Zombie {
+		t.Errorf("healthy = %v zombie = %v, want both false", report.Healthy, report.Zombie)
+	}
+	if !strings.Contains(report.Detail, probeErr.Error()) {
+		t.Errorf("detail = %q, want it to name the probe failure", report.Detail)
+	}
+
+	data, err := json.Marshal(report)
+	if err != nil {
+		t.Fatalf("json.Marshal failed: %v", err)
+	}
+	var parsed map[string]interface{}
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		t.Fatalf("json.Unmarshal failed: %v", err)
+	}
+	if parsed["liveness_known"] != false {
+		t.Errorf("liveness_known = %v, want false", parsed["liveness_known"])
+	}
+	if parsed["status"] != "liveness-unknown" {
+		t.Errorf("status = %v, want liveness-unknown", parsed["status"])
+	}
+}
+
+// TestSessionHealthDetail_SessionDeadNamesTheCause records why session-dead was
+// read as a liveness finding for an agent address: the status is a fact about
+// the NAME, and nothing in the output said so (gt-550).
+func TestSessionHealthDetail_SessionDeadNamesTheCause(t *testing.T) {
+	detail := sessionHealthDetail("gastown/furiosa", tmux.SessionDead, nil)
+	if !strings.Contains(detail, "no tmux session named") {
+		t.Errorf("detail = %q, want it to say no session answers to that name", detail)
+	}
+	if !strings.Contains(detail, "not a report about an agent process") {
+		t.Errorf("detail = %q, want it to disclaim being an agent liveness finding", detail)
+	}
+
+	// Reports about states that ARE about the agent must keep saying so.
+	if got := sessionHealthDetail("gt-vault", tmux.AgentDead, nil); !strings.Contains(got, "no agent process") {
+		t.Errorf("agent-dead detail = %q, want it to describe the missing agent process", got)
+	}
+	if got := sessionHealthDetail("gt-vault", tmux.SessionHealthy, nil); got != "" {
+		t.Errorf("healthy detail = %q, want empty", got)
+	}
+}
+
+// TestRunSessionHealthSessionDeadStillExitsZero guards the contract this fix
+// deliberately did not change: the help says the command exits successfully for
+// all valid health states, and session-dead is one. Only a failed probe — an
+// operational failure — returns non-zero.
+func TestRunSessionHealthSessionDeadStillExitsZero(t *testing.T) {
+	oldJSON := sessionHealthJSON
+	oldMaxInactivity := sessionHealthMaxInactivity
+	oldStdout := os.Stdout
+	t.Cleanup(func() {
+		sessionHealthJSON = oldJSON
+		sessionHealthMaxInactivity = oldMaxInactivity
+		os.Stdout = oldStdout
+	})
+
+	sessionHealthJSON = false
+	sessionHealthMaxInactivity = 0
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe failed: %v", err)
+	}
+	os.Stdout = w
+
+	runErr := runSessionHealth(sessionHealthCmd, []string{"gt-session-health-test-nonexistent"})
+	if closeErr := w.Close(); closeErr != nil {
+		t.Fatalf("closing pipe writer: %v", closeErr)
+	}
+	os.Stdout = oldStdout
+	if runErr != nil {
+		t.Fatalf("runSessionHealth returned %v; a nonexistent session is a valid health state", runErr)
+	}
+
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("reading stdout pipe: %v", err)
+	}
+	if !strings.Contains(string(out), "no tmux session named") {
+		t.Errorf("output = %q, want it to explain that no session answers to that name", string(out))
 	}
 }
 

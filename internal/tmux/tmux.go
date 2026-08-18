@@ -2383,6 +2383,16 @@ const (
 	// AgentHung means the tmux session and agent process exist but there has
 	// been no tmux activity for longer than the specified threshold.
 	AgentHung
+	// SessionUnknown means liveness could not be determined: a probe failed and
+	// nothing is known about the session or the agent inside it.
+	//
+	// It is deliberately not one of the death states. Callers act on death by
+	// clearing work, killing sessions, and reclaiming sandboxes; a failed tmux
+	// query used to arrive as SessionDead, which meant one unreachable tmux
+	// server reported the entire town as dead agents (gt-550).
+	//
+	// Declared last so the existing values keep their numbers.
+	SessionUnknown
 )
 
 // String returns a human-readable label for the zombie status.
@@ -2396,9 +2406,17 @@ func (z ZombieStatus) String() string {
 		return "agent-dead"
 	case AgentHung:
 		return "agent-hung"
+	case SessionUnknown:
+		return "liveness-unknown"
 	default:
 		return "unknown"
 	}
+}
+
+// IsKnown reports whether the status is an observation rather than a failure to
+// observe. Callers that destroy state on a negative verdict must check this.
+func (z ZombieStatus) IsKnown() bool {
+	return z != SessionUnknown
 }
 
 // IsZombie returns true if the status represents a zombie (any non-healthy state
@@ -2407,41 +2425,80 @@ func (z ZombieStatus) IsZombie() bool {
 	return z == AgentDead || z == AgentHung
 }
 
-// CheckSessionHealth determines the health status of an agent session.
+// sessionHealthProber is the slice of tmux that a health check needs, isolated
+// so the level-by-level rules can be tested without a tmux server.
+type sessionHealthProber interface {
+	HasSession(name string) (bool, error)
+	IsAgentAliveChecked(session string) (bool, error)
+	GetSessionActivity(session string) (time.Time, error)
+}
+
+// CheckSessionHealth determines the health status of an agent session,
+// discarding probe errors.
+//
+// Prefer CheckSessionHealthChecked anywhere the verdict drives a destructive
+// action: this form reports a failed probe as SessionUnknown, which is honest,
+// but gives the caller no way to say why.
+func (t *Tmux) CheckSessionHealth(session string, maxInactivity time.Duration) ZombieStatus {
+	status, _ := t.CheckSessionHealthChecked(session, maxInactivity)
+	return status
+}
+
+// CheckSessionHealthChecked is like CheckSessionHealth, but preserves
+// liveness-query errors for callers that must not treat unknown state as
+// confirmed death — the same convention as IsAgentAliveChecked and the other
+// -Checked pairs in this file.
+//
 // It performs three levels of checking:
 //  1. Session existence (tmux has-session)
-//  2. Agent process liveness (IsAgentAlive — checks process tree)
+//  2. Agent process liveness (IsAgentAliveChecked — checks process tree)
 //  3. Activity staleness (GetSessionActivity — checks tmux output timestamp)
 //
 // The maxInactivity parameter controls how long a session can be idle before
 // being considered hung. Pass 0 to skip activity checking (only check process
 // liveness). A reasonable default for production is 10-15 minutes.
 //
-// This is the preferred unified method for zombie detection across all agent types.
-func (t *Tmux) CheckSessionHealth(session string, maxInactivity time.Duration) ZombieStatus {
+// A failed probe at level 1 or 2 yields (SessionUnknown, err). It must not yield
+// a death verdict: HasSession already distinguishes "no such session" (false,
+// nil) from "the query itself failed" (false, err), and folding the second into
+// SessionDead meant an unreachable tmux server reported every agent in the town
+// as dead at once (gt-550). Level 3 has always refused to answer on error; this
+// makes levels 1 and 2 consistent with it.
+func (t *Tmux) CheckSessionHealthChecked(session string, maxInactivity time.Duration) (ZombieStatus, error) {
+	return checkSessionHealth(t, session, maxInactivity)
+}
+
+func checkSessionHealth(p sessionHealthProber, session string, maxInactivity time.Duration) (ZombieStatus, error) {
 	// Level 1: Does the tmux session exist?
-	alive, err := t.HasSession(session)
-	if err != nil || !alive {
-		return SessionDead
+	alive, err := p.HasSession(session)
+	if err != nil {
+		return SessionUnknown, fmt.Errorf("querying tmux session %q: %w", session, err)
+	}
+	if !alive {
+		return SessionDead, nil
 	}
 
 	// Level 2: Is the agent process running inside the session?
-	if !t.IsAgentAlive(session) {
-		return AgentDead
+	agentAlive, err := p.IsAgentAliveChecked(session)
+	if err != nil {
+		return SessionUnknown, fmt.Errorf("querying agent process in session %q: %w", session, err)
+	}
+	if !agentAlive {
+		return AgentDead, nil
 	}
 
 	// Level 3: Has there been recent activity? (optional)
 	if maxInactivity > 0 {
-		lastActivity, err := t.GetSessionActivity(session)
+		lastActivity, err := p.GetSessionActivity(session)
 		if err == nil && !lastActivity.IsZero() {
 			if time.Since(lastActivity) > maxInactivity {
-				return AgentHung
+				return AgentHung, nil
 			}
 		}
 		// On error or zero time, skip activity check — don't false-positive
 	}
 
-	return SessionHealthy
+	return SessionHealthy, nil
 }
 
 // processMatchesNames checks if a process's binary name matches any of the given names.

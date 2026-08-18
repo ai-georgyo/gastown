@@ -2788,6 +2788,7 @@ func TestZombieStatusString(t *testing.T) {
 		{SessionDead, "session-dead", false},
 		{AgentDead, "agent-dead", true},
 		{AgentHung, "agent-hung", true},
+		{SessionUnknown, "liveness-unknown", false},
 	}
 
 	for _, tc := range tests {

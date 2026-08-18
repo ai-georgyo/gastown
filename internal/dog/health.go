@@ -102,6 +102,13 @@ func (hc *HealthChecker) Check(d *Dog, maxInactivity time.Duration, autoClear bo
 				result.Recommendation = "hung: agent alive but no tmux activity"
 			}
 
+		case tmux.SessionUnknown:
+			// A probe failed, so nothing was observed. Flag it, but do not
+			// auto-clear: clearing work on an unknown verdict is how a single
+			// unreachable tmux server would reclaim every working dog (gt-550).
+			result.NeedsAttention = true
+			result.Recommendation = "liveness unknown: tmux probe failed - not clearing work"
+
 		default: // SessionHealthy — status.String() already set above
 		}
 
