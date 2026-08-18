@@ -111,8 +111,8 @@ func (c *LinkedPaneCheck) Run(ctx *CheckContext) *CheckResult {
 	}
 }
 
-// Fix kills sessions with linked panes (except mayor session).
-// The daemon will recreate them with independent panes.
+// Fix kills sessions with linked panes (except the mayor session and crew
+// sessions). The daemon will recreate them with independent panes.
 func (c *LinkedPaneCheck) Fix(ctx *CheckContext) error {
 	if len(c.linkedSessions) == 0 {
 		return nil
@@ -122,6 +122,13 @@ func (c *LinkedPaneCheck) Fix(ctx *CheckContext) error {
 	var lastErr error
 
 	for _, session := range c.linkedSessions {
+		// SAFEGUARD: never auto-kill crew sessions. They are human-managed, and
+		// KillSessionWithProcesses takes every descendant process with it.
+		// Crosstalk is worth reporting to a human, not worth their unsaved work.
+		if p := crewProtection(session); p.Protected {
+			fmt.Printf("  Not killing %s: %s\n", session, p.Reason)
+			continue
+		}
 		// Use KillSessionWithProcesses to ensure all descendant processes are killed.
 		if err := t.KillSessionWithProcesses(session); err != nil {
 			lastErr = err

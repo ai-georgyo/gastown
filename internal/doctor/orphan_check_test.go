@@ -119,7 +119,7 @@ func TestIsCrewSession(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.session, func(t *testing.T) {
-			got := isCrewSession(tt.session)
+			got, _ := isCrewSession(tt.session)
 			if got != tt.want {
 				t.Errorf("isCrewSession(%q) = %v, want %v", tt.session, got, tt.want)
 			}
@@ -317,24 +317,27 @@ func TestOrphanSessionCheck_FixProtectsCrewSessions(t *testing.T) {
 	setupTestRegistry(t)
 	check := NewOrphanSessionCheck()
 
-	// Simulate cached orphan sessions including a crew session
+	// Simulate cached orphan sessions including crew sessions
+	term := newFakeTerminator()
+	check.terminator = term
 	check.orphanSessions = []string{
 		"gt-crew-max",     // Crew - should be protected
-		"zz-witness",      // Not crew - would be killed
+		"pf-ghost",        // Not crew, parses cleanly - killed
 		"nif-crew-codex1", // Crew - should be protected
 	}
 
-	// Verify isCrewSession correctly identifies crew sessions
-	for _, sess := range check.orphanSessions {
-		if sess == "gt-crew-max" || sess == "nif-crew-codex1" {
-			if !isCrewSession(sess) {
-				t.Errorf("isCrewSession(%q) should return true for crew session", sess)
-			}
-		} else {
-			if isCrewSession(sess) {
-				t.Errorf("isCrewSession(%q) should return false for non-crew session", sess)
-			}
+	if err := check.Fix(&CheckContext{TownRoot: t.TempDir()}); err != nil {
+		t.Fatalf("Fix returned error: %v", err)
+	}
+
+	// Assert on the kill, not on the predicate's return value.
+	for _, sess := range []string{"gt-crew-max", "nif-crew-codex1"} {
+		if term.wasKilled(sess) {
+			t.Errorf("crew session %q was killed (killed: %v)", sess, term.killed)
 		}
+	}
+	if !term.wasKilled("pf-ghost") {
+		t.Errorf("non-crew orphan was not killed (killed: %v)", term.killed)
 	}
 }
 
@@ -362,11 +365,17 @@ func TestIsCrewSession_ComprehensivePatterns(t *testing.T) {
 		{"hq-mayor", false, "mayor is not crew"},
 		{"", false, "empty string"},
 		{"gt-morsov", false, "polecat, not crew"},
+
+		// Names the parser cannot resolve are NOT crew, but they are also not
+		// disposable — see TestClassifySessionForKill for what the kill path
+		// does with them.
+		{"hq-crew-joe", false, "unparseable: hq is not a registered rig prefix"},
+		{"gt-gastown-crew-joe", false, "long form parses as a polecat, not crew"},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.session, func(t *testing.T) {
-			got := isCrewSession(tt.session)
+			got, _ := isCrewSession(tt.session)
 			if got != tt.want {
 				t.Errorf("isCrewSession(%q) = %v, want %v: %s", tt.session, got, tt.want, tt.reason)
 			}
