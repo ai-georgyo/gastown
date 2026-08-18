@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strconv"
+	"strings"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/style"
@@ -53,9 +55,31 @@ type StaleOutput struct {
 	Skipped       bool   `json:"skipped,omitempty"`
 	SkipReason    string `json:"skip_reason,omitempty"`
 	Error         string `json:"error,omitempty"`
+
+	// Binary skew: which gt is actually running, versus which one is
+	// installed. Independent of commit staleness — a fresh binary is no help
+	// if this session is still executing the one it started with. (gt-3pk)
+	Superseded   bool   `json:"superseded"`
+	PathShadowed bool   `json:"path_shadowed"`
+	RunningExe   string `json:"running_exe,omitempty"`
+	PathExe      string `json:"path_exe,omitempty"`
+	InstalledExe string `json:"installed_exe,omitempty"`
+}
+
+// applySkew copies the binary skew fields onto a staleness result. Skew is
+// reported on every code path, including the ones where staleness itself could
+// not be determined, because it is the more actionable of the two.
+func applySkew(output *StaleOutput, skew *version.BinarySkewInfo) {
+	output.RunningExe = skew.RunningPath
+	output.PathExe = skew.PathPath
+	output.InstalledExe = skew.InstalledPath
+	output.Superseded = skew.Superseded
+	output.PathShadowed = skew.PathShadowed
 }
 
 func runStale(cmd *cobra.Command, args []string) error {
+	skew := version.CheckBinarySkew()
+
 	// Find the gastown repo
 	repoRoot, err := version.GetRepoRoot()
 	if err != nil {
@@ -63,7 +87,9 @@ func runStale(cmd *cobra.Command, args []string) error {
 			return NewSilentExit(2)
 		}
 		if staleJSON {
-			return outputStaleJSON(StaleOutput{Error: err.Error()})
+			out := StaleOutput{Error: err.Error()}
+			applySkew(&out, skew)
+			return outputStaleJSON(out)
 		}
 		return fmt.Errorf("cannot find gastown repo: %w", err)
 	}
@@ -77,7 +103,9 @@ func runStale(cmd *cobra.Command, args []string) error {
 			return NewSilentExit(2)
 		}
 		if staleJSON {
-			return outputStaleJSON(StaleOutput{Error: info.Error.Error()})
+			out := StaleOutput{Error: info.Error.Error()}
+			applySkew(&out, skew)
+			return outputStaleJSON(out)
 		}
 		return fmt.Errorf("staleness check failed: %w", info.Error)
 	}
@@ -102,12 +130,16 @@ func runStale(cmd *cobra.Command, args []string) error {
 		Skipped:       info.Skipped,
 		SkipReason:    info.SkipReason,
 	}
+	applySkew(&output, skew)
 
 	if staleJSON {
 		return outputStaleJSON(output)
 	}
 
-	return outputStaleText(output)
+	if err := outputStaleText(output); err != nil {
+		return err
+	}
+	return outputSkewText(skew)
 }
 
 func staleQuietExitCode(info *version.StaleBinaryInfo) int {
@@ -160,4 +192,43 @@ func outputStaleText(output StaleOutput) error {
 		}
 	}
 	return nil
+}
+
+// outputSkewText prints the binary skew section, and only when there is skew:
+// on a healthy machine the running binary is the installed one and there is
+// nothing to say. Skew is printed after the staleness verdict because it
+// overrides it — "binary is fresh" is about the installed gt, not the one you
+// are talking to.
+func outputSkewText(skew *version.BinarySkewInfo) error {
+	if skew.Skipped || (!skew.Superseded && !skew.PathShadowed) {
+		return nil
+	}
+
+	fmt.Printf("\n%s %s\n", style.Warning.Render("⚠"), skew.Describe())
+	fmt.Printf("  Running:   %s\n", skew.RunningPath)
+	if skew.PathPath != "" {
+		fmt.Printf("  PATH:      %s\n", skew.PathPath)
+	}
+	fmt.Printf("  Installed: %s\n", skew.InstalledPath)
+	fmt.Printf("  %s\n", style.Dim.Render("(via "+skew.InstalledFrom+")"))
+	for _, detail := range skew.Details() {
+		fmt.Printf("  %s\n", detail)
+	}
+
+	if procs, err := version.ScanSupersededProcesses(skew.InstalledPaths); err == nil && len(procs) > 0 {
+		fmt.Printf("\n  %d live gt process(es) are not running the installed binary:\n", len(procs))
+		for _, group := range version.GroupByExe(procs) {
+			fmt.Printf("    %d × %s\n", len(group.PIDs), group.Exe)
+			fmt.Printf("      pids: %s\n", joinPIDs(group.PIDs))
+		}
+	}
+	return nil
+}
+
+func joinPIDs(pids []int) string {
+	parts := make([]string, len(pids))
+	for i, pid := range pids {
+		parts[i] = strconv.Itoa(pid)
+	}
+	return strings.Join(parts, " ")
 }

@@ -32,10 +32,14 @@ The Deacon evaluates this before dispatch. If gate closed, skip.
 
 ## Detection
 
-Check binary staleness:
+Check binary staleness. Invoke the **installed** gt explicitly rather than
+whatever `gt` resolves to: a long-lived session pins the store path it started
+with, so `gt` on PATH can be superseded code reporting on itself, answering
+"stale" after every successful rebuild (gt-3pk).
 
 ```bash
-gt stale --json
+GT="$HOME/.nix-profile/bin/gt"   # or $HOME/.local/bin/gt
+"$GT" stale --json
 ```
 
 Parse the JSON output and check these fields:
@@ -44,6 +48,9 @@ Parse the JSON output and check these fields:
   This means the repo is on a non-main branch or HEAD is not a descendant of the
   binary commit (would be a downgrade).
 - If `"safe_to_rebuild": true` → proceed to build
+- `"superseded": true` means the gt that produced this JSON is not the installed
+  binary. Rebuilding will not change what that session runs — the session has to
+  be restarted. Re-run through the installed path before acting on the verdict.
 
 If `safe_to_rebuild` is false, record a skip wisp:
 ```bash
@@ -75,6 +82,15 @@ cd ~/gt/gastown/mayor/rig && make build && make safe-install
 **IMPORTANT**: Use `make safe-install` (not `make install`) to avoid restarting
 the daemon while sessions are active. safe-install replaces the binary but does
 NOT restart the daemon — sessions will pick up the new binary on their next cycle.
+
+**Installing is not deploying.** Long-lived sessions keep executing the binary
+they started with; nothing re-execs them. After a rebuild, check which sessions
+are still on superseded code and restart them:
+
+```bash
+"$GT" stale        # lists live gt processes not running the installed binary
+"$GT" doctor       # same finding as the superseded-binary check
+```
 
 ## Record Result
 

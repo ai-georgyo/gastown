@@ -141,6 +141,7 @@ func persistentPreRun(cmd *cobra.Command, args []string) error {
 	// Check for stale binary (warning only, doesn't block)
 	if !beadsExempt {
 		checkStaleBinaryWarning()
+		checkSupersededBinaryWarning()
 	}
 
 	// Check town root branch (warning only, non-blocking)
@@ -326,6 +327,36 @@ func checkStaleBinaryWarning() {
 			fmt.Fprintf(os.Stderr, "    %s Run 'gt stale' for details; switch to a build branch before rebuilding\n", style.ArrowPrefix)
 		}
 	}
+}
+
+// supersededBinaryWarned tracks if we've already warned about a superseded
+// binary in this session, matching the stale-binary warning above.
+var supersededBinaryWarned = os.Getenv("GT_SUPERSEDED_WARNED") == "1"
+
+// checkSupersededBinaryWarning warns when this process is executing a gt other
+// than the installed one. A long-lived session pins the resolved store path of
+// whatever gt was current when it started; an upgrade swaps the install
+// symlink but never re-execs the session, so the session keeps running — and
+// keeps resolving `gt` to — superseded code. Nothing else surfaces this, and
+// `which gt` actively misleads by reporting the pinned path. (gt-3pk)
+//
+// Only skew that came through $PATH is worth a warning on every command:
+// deliberately invoking a build output (./gt-build/gt) is not a defect.
+func checkSupersededBinaryWarning() {
+	if supersededBinaryWarned {
+		return
+	}
+
+	skew := version.CheckBinarySkew()
+	if skew.Skipped || !skew.Superseded || !skew.RunningOnPath {
+		return
+	}
+
+	supersededBinaryWarned = true
+	_ = os.Setenv("GT_SUPERSEDED_WARNED", "1")
+
+	fmt.Fprintf(os.Stderr, "%s %s\n", style.WarningPrefix, skew.Describe())
+	fmt.Fprintf(os.Stderr, "    %s Restart this session; run 'gt stale' for details\n", style.ArrowPrefix)
 }
 
 // Execute runs the root command and returns an exit code.

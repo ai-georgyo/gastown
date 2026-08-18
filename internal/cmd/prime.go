@@ -24,6 +24,7 @@ import (
 	"github.com/steveyegge/gastown/internal/telemetry"
 	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/util"
+	"github.com/steveyegge/gastown/internal/version"
 	"github.com/steveyegge/gastown/internal/workspace"
 	worktreeintegrity "github.com/steveyegge/gastown/internal/worktree"
 )
@@ -155,6 +156,7 @@ func runPrime(cmd *cobra.Command, args []string) (retErr error) {
 	}
 
 	warnRoleMismatch(roleInfo, cwd)
+	warnSupersededBinary()
 
 	ctx := RoleContext{
 		Role:     roleInfo.Role,
@@ -424,6 +426,34 @@ func warnRoleMismatch(roleInfo RoleInfo, cwd string) {
 	fmt.Println("This can cause commands to misbehave. Either:")
 	fmt.Println("  1. cd to your home directory, OR")
 	fmt.Println("  2. Use absolute paths for gt/bd commands")
+	fmt.Println()
+}
+
+// warnSupersededBinary tells an agent, at the one moment it can act on it, that
+// its session is executing a gt other than the installed one. Priming is where
+// this belongs: it happens once per session, it is what an agent runs after a
+// restart, and a restart is the fix. The per-command warning in root.go does
+// not reach here — prime is exempt from those checks. (gt-3pk)
+//
+// Suppressed in --state mode, whose output is parsed.
+func warnSupersededBinary() {
+	if primeState {
+		return
+	}
+
+	skew := version.CheckBinarySkew()
+	if skew.Skipped || !skew.Superseded {
+		return
+	}
+
+	fmt.Printf("\n%s\n", style.Bold.Render("⚠️  SUPERSEDED gt BINARY"))
+	fmt.Printf("This session is running %s\n", skew.RunningPath)
+	fmt.Printf("The installed gt is    %s\n", skew.InstalledPath)
+	fmt.Println()
+	for _, detail := range skew.Details() {
+		fmt.Printf("%s\n", detail)
+	}
+	fmt.Println("Run 'gt stale' to see every session still on superseded code.")
 	fmt.Println()
 }
 

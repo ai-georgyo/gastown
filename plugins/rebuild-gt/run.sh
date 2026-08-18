@@ -7,7 +7,20 @@
 
 set -euo pipefail
 
-TOWN_ROOT="${GT_TOWN_ROOT:-$(gt town root 2>/dev/null)}"
+# Always drive the INSTALLED gt, never the session's PATH. A long-lived session
+# pins the resolved store path of whatever gt was current when it started, so
+# `gt stale` run through PATH can be superseded code reporting on itself — it
+# answers "stale" forever, and every cycle rebuilds a binary that was already
+# fresh. (gt-3pk)
+GT="gt"
+for candidate in "$HOME/.nix-profile/bin/gt" "$HOME/.local/bin/gt"; do
+  if [ -x "$candidate" ]; then
+    GT="$candidate"
+    break
+  fi
+done
+
+TOWN_ROOT="${GT_TOWN_ROOT:-$("$GT" town root 2>/dev/null)}"
 RIG_ROOT="${TOWN_ROOT}/gastown/mayor/rig"
 
 log() { echo "[rebuild-gt] $*"; }
@@ -15,8 +28,8 @@ log() { echo "[rebuild-gt] $*"; }
 # --- Detection ---------------------------------------------------------------
 
 log "Checking binary staleness..."
-STALE_JSON=$(gt stale --json 2>/dev/null) || {
-  log "gt stale --json failed, skipping"
+STALE_JSON=$("$GT" stale --json 2>/dev/null) || {
+  log "$GT stale --json failed, skipping"
   exit 0
 }
 
@@ -25,14 +38,14 @@ SAFE=$(echo "$STALE_JSON" | python3 -c "import json,sys; print(json.load(sys.std
 
 if [ "$IS_STALE" != "True" ]; then
   log "Binary is fresh. Nothing to do."
-  gt plugin record-run --plugin rebuild-gt --result success --rig gastown \
+  "$GT" plugin record-run --plugin rebuild-gt --result success --rig gastown \
     --title "rebuild-gt: binary is fresh" >/dev/null 2>&1 || true
   exit 0
 fi
 
 if [ "$SAFE" != "True" ]; then
   log "Not safe to rebuild (not on main or would be a downgrade). Skipping."
-  gt plugin record-run --plugin rebuild-gt --result skipped --rig gastown \
+  "$GT" plugin record-run --plugin rebuild-gt --result skipped --rig gastown \
     --title "Plugin: rebuild-gt [skipped]" \
     --description "Skipped: not safe to rebuild" >/dev/null 2>&1 || true
   exit 0
@@ -50,7 +63,7 @@ fi
 DIRTY=$(git -C "$RIG_ROOT" status --porcelain 2>/dev/null)
 if [ -n "$DIRTY" ]; then
   log "Repo is dirty, skipping rebuild."
-  gt plugin record-run --plugin rebuild-gt --result skipped --rig gastown \
+  "$GT" plugin record-run --plugin rebuild-gt --result skipped --rig gastown \
     --title "Plugin: rebuild-gt [skipped]" \
     --description "Skipped: repo has uncommitted changes" >/dev/null 2>&1 || true
   exit 0
@@ -59,7 +72,7 @@ fi
 BRANCH=$(git -C "$RIG_ROOT" branch --show-current 2>/dev/null)
 if [ "$BRANCH" != "main" ]; then
   log "Not on main branch (on $BRANCH), skipping rebuild."
-  gt plugin record-run --plugin rebuild-gt --result skipped --rig gastown \
+  "$GT" plugin record-run --plugin rebuild-gt --result skipped --rig gastown \
     --title "Plugin: rebuild-gt [skipped]" \
     --description "Skipped: not on main branch (on $BRANCH)" >/dev/null 2>&1 || true
   exit 0
@@ -67,20 +80,29 @@ fi
 
 # --- Build -------------------------------------------------------------------
 
-OLD_VER=$(gt version 2>/dev/null | head -1 || echo "unknown")
+# make safe-install writes to the Makefile's INSTALL_DIR. Report the version of
+# the artifact this plugin actually replaced, not of whichever gt answered the
+# staleness question — reading the wrong binary is what made this whole class of
+# bug invisible. (gt-3pk)
+INSTALLED_BIN="$HOME/.local/bin/gt"
+
+gt_version() { "$1" version 2>/dev/null | head -1 || true; }
+
+OLD_VER=$(gt_version "$GT")
 log "Rebuilding gt from $RIG_ROOT..."
 
 if (cd "$RIG_ROOT" && make build && make safe-install) 2>&1; then
-  NEW_VER=$(gt version 2>/dev/null | head -1 || echo "unknown")
+  NEW_VER=$(gt_version "$INSTALLED_BIN")
+  : "${OLD_VER:=unknown}" "${NEW_VER:=unknown}"
   log "Rebuilt: $OLD_VER -> $NEW_VER"
-  gt plugin record-run --plugin rebuild-gt --result success --rig gastown \
+  "$GT" plugin record-run --plugin rebuild-gt --result success --rig gastown \
     --title "rebuild-gt: $OLD_VER -> $NEW_VER" >/dev/null 2>&1 || true
 else
   ERROR="make build/safe-install failed"
   log "FAILED: $ERROR"
-  gt plugin record-run --plugin rebuild-gt --result failure --rig gastown \
+  "$GT" plugin record-run --plugin rebuild-gt --result failure --rig gastown \
     --title "Plugin: rebuild-gt [failure]" \
     --description "Build failed: $ERROR" >/dev/null 2>&1 || true
-  gt escalate "Plugin FAILED: rebuild-gt" -s medium 2>/dev/null || true
+  "$GT" escalate "Plugin FAILED: rebuild-gt" -s medium 2>/dev/null || true
   exit 1
 fi
