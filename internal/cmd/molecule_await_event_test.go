@@ -403,7 +403,7 @@ func TestReadPendingEventsBoundedFinishes(t *testing.T) {
 	dir := t.TempDir()
 	os.WriteFile(filepath.Join(dir, "a.event"), []byte(`{"type":"X"}`), 0644)
 
-	events := readPendingEventsBounded(context.Background(), dir, 2*time.Second)
+	events := readPendingEventsBounded(context.Background(), &channelReader{dir: dir}, 2*time.Second)
 	if len(events) != 1 {
 		t.Errorf("expected 1 event, got %d", len(events))
 	}
@@ -417,7 +417,7 @@ func TestReadPendingEventsBoundedCtxDone(t *testing.T) {
 	cancel()
 
 	start := time.Now()
-	_ = readPendingEventsBounded(ctx, dir, 5*time.Second)
+	_ = readPendingEventsBounded(ctx, &channelReader{dir: dir}, 5*time.Second)
 	elapsed := time.Since(start)
 	if elapsed > 500*time.Millisecond {
 		t.Errorf("bounded read took %v with cancelled ctx; expected prompt return", elapsed)
