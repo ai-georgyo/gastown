@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The nix build stamps a version you can tell apart** (gt-prx). `flake.nix`
+  set `-X github.com/gastownhall/gastown/internal/cmd.Build=nix`, but the module
+  is `github.com/steveyegge/gastown` (go.mod), and the linker silently discards
+  an `-X` naming a path that does not exist. So the flag had never applied, and
+  because `buildGoModule` compiles from a store copy with no `.git`,
+  `debug.ReadBuildInfo()` supplied no `vcs.revision` either: every nix-built gt,
+  of every vintage, printed exactly `gt version 1.2.1 (dev)`. Two binaries three
+  days apart were indistinguishable at the one command meant to distinguish
+  them, which is how a defect fixed on 2026-08-15 came to be re-reported as live
+  on 2026-08-18 by four rigs and re-verified by the mayor — all against a stale
+  binary that `which gt` still resolved to. The path is corrected and the flake
+  now stamps `Commit` from `self.rev` (falling back to `self.dirtyRev`, omitted
+  entirely when neither exists), so `gt version` reports
+  `1.2.1 (nix: ac7cca7c187c)` and `internal/version`'s stale-binary check —
+  which reads that same `Commit` — has something to compare for the first time
+  on a nix build. Binaries already deployed still print `(dev)`; the discriminator
+  for those remains `strings <binary>` against a symbol added or removed since.
 - **`gt polecat check-recovery` no longer tells you to nuke a working polecat**
   (gt-85p / hq-fhb). The decision engine correctly returned `WORKING` for a
   live, mid-task polecat, but the human-readable renderer switched on the
