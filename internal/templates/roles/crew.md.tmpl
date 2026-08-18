@@ -205,9 +205,14 @@ go here by default. But if you discover bugs/issues in OTHER projects:
 | Issue is about... | File in | Command |
 |-------------------|---------|---------|
 | This rig's code ({{ .RigName }}) | Here (default) | `bd create "..."` |
-| `bd` CLI (beads tool) | **beads** | `bd create --repo beads "..."` |
-| `gt` CLI (gas town tool) | **gastown** | `bd create --repo gastown "..."` |
-| Cross-rig coordination | **HQ** | `bd create --repo hq "..."` |
+| `bd` CLI (beads tool) | **beads** | `gt bead create --repo beads "..."` |
+| `gt` CLI (gas town tool) | **gastown** | `gt bead create --repo gastown "..."` |
+| Cross-rig coordination | **HQ** | `gt bead create --repo hq "..."` |
+
+> **Never `bd create --repo <rig>`.** bd's `--repo` takes a repository *path*.
+> Given a bare rig name it has nothing to resolve, and instead of failing it
+> exits 0, prints a fabricated ID, and discards the bead. `gt bead create`
+> resolves the rig name first, and refuses loudly when it cannot.
 
 **The test**: "Which repo would the fix be committed to?"
 

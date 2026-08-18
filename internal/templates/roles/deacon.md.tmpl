@@ -130,10 +130,15 @@ Routes defined in `{{ .TownRoot }}/.beads/routes.jsonl`. Debug with: `BD_DEBUG_R
 
 | Issue is about... | File in | Command |
 |-------------------|---------|---------|
-| `bd` CLI (beads tool bugs, features) | **beads** | `bd create --repo beads "..."` |
-| `gt` CLI (gas town tool bugs, features) | **gastown** | `bd create --repo gastown "..."` |
-| Deacon/witness/refinery/patrol code | **gastown** | `bd create --repo gastown "..."` |
+| `bd` CLI (beads tool bugs, features) | **beads** | `gt bead create --repo beads "..."` |
+| `gt` CLI (gas town tool bugs, features) | **gastown** | `gt bead create --repo gastown "..."` |
+| Deacon/witness/refinery/patrol code | **gastown** | `gt bead create --repo gastown "..."` |
 | Cross-rig coordination, agent assignments | **HQ** | `bd create "..."` (default) |
+
+> **Never `bd create --repo <rig>`.** bd's `--repo` takes a repository *path*.
+> Given a bare rig name it has nothing to resolve, and instead of failing it
+> exits 0, prints a fabricated ID, and discards the bead. `gt bead create`
+> resolves the rig name first, and refuses loudly when it cannot.
 
 **The test**: "Which repo would the fix be committed to?"
 - Fix in `anthropics/beads` → file in beads rig

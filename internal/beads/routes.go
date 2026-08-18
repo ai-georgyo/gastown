@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/steveyegge/gastown/internal/config"
@@ -341,6 +342,12 @@ func ResolveRepoAliasBeadsDir(townRoot, repo string) (string, bool) {
 // and returns the canonical .beads target for callers to pin via BEADS_DIR.
 // Unresolved, path-like, duplicate, or positional --repo values are preserved so
 // bd keeps its native --repo behavior outside Gas Town aliases.
+//
+// This rewrite is what makes the alias form work at all: bd's own --repo takes a
+// path, and handed a bare rig name it exits 0, prints a fabricated ID, and drops
+// the write (gt-789). Any caller that lets an unrewritten alias reach bd is
+// silently losing beads, so callers should refuse rather than pass one through --
+// see BDCreateRepoAlias for detecting that case.
 func RewriteBDCreateRepoAlias(townRoot string, argv []string) ([]string, string) {
 	cmdIndex, ok := BDSubcommandIndex(argv)
 	if !ok || argv[cmdIndex] != "create" {
@@ -384,6 +391,94 @@ func RewriteBDCreateRepoAlias(townRoot string, argv []string) ([]string, string)
 	}
 
 	return rewritten, ""
+}
+
+// RepoAliases returns the repo aliases ResolveRepoAliasBeadsDir accepts for this
+// town, sorted, so callers can name the valid choices when an alias does not
+// resolve. Only aliases backed by a real .beads directory are listed.
+func RepoAliases(townRoot string) []string {
+	if townRoot == "" {
+		return nil
+	}
+
+	seen := map[string]bool{}
+	var aliases []string
+	add := func(name string) {
+		if name == "" || seen[name] {
+			return
+		}
+		if _, ok := ResolveRepoAliasBeadsDir(townRoot, name); !ok {
+			return
+		}
+		seen[name] = true
+		aliases = append(aliases, name)
+	}
+
+	add("hq")
+	add("town")
+
+	routes, err := LoadRoutes(filepath.Join(townRoot, ".beads"))
+	if err != nil {
+		sort.Strings(aliases)
+		return aliases
+	}
+	for _, r := range routes {
+		if r.Path == "" || r.Path == "." {
+			continue
+		}
+		parts := strings.SplitN(r.Path, "/", 2)
+		if len(parts) > 0 {
+			add(parts[0])
+		}
+	}
+
+	sort.Strings(aliases)
+	return aliases
+}
+
+// BDCreateRepoAlias reports the --repo value of a bd create argv when that value
+// is a bare Gas Town repo alias rather than a path. Callers use it to separate the
+// alias form, which raw bd cannot resolve, from the path form, which bd handles
+// natively and must be left alone.
+//
+// ok is false when argv is not a bd create, when it carries anything other than
+// exactly one --repo, or when the value is path-like. A true result says only that
+// the value is shaped like an alias; use ResolveRepoAliasBeadsDir to learn whether
+// it names a rig that actually exists.
+func BDCreateRepoAlias(argv []string) (string, bool) {
+	cmdIndex, ok := BDSubcommandIndex(argv)
+	if !ok || argv[cmdIndex] != "create" {
+		return "", false
+	}
+	if countBDRepoFlags(argv, cmdIndex+1) != 1 {
+		return "", false
+	}
+
+	for i := 0; i < len(argv); i++ {
+		arg := argv[i]
+		if arg == "--" {
+			break
+		}
+		value := ""
+		switch {
+		case arg == "--repo":
+			if i+1 >= len(argv) {
+				return "", false
+			}
+			value = argv[i+1]
+			i++
+		case strings.HasPrefix(arg, "--repo="):
+			value = strings.TrimPrefix(arg, "--repo=")
+		default:
+			continue
+		}
+		if isRepoPathLike(value) {
+			return "", false
+		}
+		return value, true
+	}
+
+	return "", false
 }
 
 func countBDRepoFlags(argv []string, start int) int {

@@ -160,13 +160,20 @@ Routes defined in `{{ .TownRoot }}/.beads/routes.jsonl`. `{{ cmd }} rig add` aut
 
 | Issue is about... | File in | Command |
 |-------------------|---------|---------|
-| `bd` CLI (beads tool) | **beads** | `bd create --repo beads "..."` |
-| `gt` CLI (gas town tool) | **gastown** | `bd create --repo gastown "..."` |
-| Polecat/witness/refinery/convoy code | **gastown** | `bd create --repo gastown "..."` |
-| Wyvern game features | **wyvern** | `bd create --repo wyvern "..."` |
+| `bd` CLI (beads tool) | **beads** | `gt bead create --repo beads "..."` |
+| `gt` CLI (gas town tool) | **gastown** | `gt bead create --repo gastown "..."` |
+| Polecat/witness/refinery/convoy code | **gastown** | `gt bead create --repo gastown "..."` |
+| Wyvern game features | **wyvern** | `gt bead create --repo wyvern "..."` |
 | Cross-rig coordination, convoys, mail | **HQ** | `bd create "..."` (default) |
 
-**IMPORTANT:** Issues are created with `bd create`, not `gt` commands.
+> **Never `bd create --repo <rig>`.** bd's `--repo` takes a repository *path*.
+> Given a bare rig name it has nothing to resolve, and instead of failing it
+> exits 0, prints a fabricated ID, and discards the bead. `gt bead create`
+> resolves the rig name first, and refuses loudly when it cannot.
+
+**IMPORTANT:** Issues are created with `bd create` in the current rig, or with
+`gt bead create --repo <rig>` to file into another one. No other `gt` command
+creates issues.
 
 **The test**: "Which repo would the fix be committed to?"
 - Fix in `anthropics/beads` → file in beads rig
