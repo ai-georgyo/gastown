@@ -21,6 +21,14 @@
           inherit system;
         };
         beadsPkg = beads.packages.${system}.default;
+
+        # The git revision this derivation was built from. A clean git tree has
+        # `self.rev`; a dirty one only `self.dirtyRev` (rev + "-dirty"); a
+        # non-git source has neither. Stamping it is what makes two nix builds
+        # tellable apart: buildGoModule builds from a store copy with no .git,
+        # so `debug.ReadBuildInfo()` reports no vcs.revision and every nix gt
+        # otherwise prints an identical "1.2.1 (dev)" (gt-prx, gt-3pk).
+        gtCommit = self.rev or (self.dirtyRev or "");
       in
       {
         packages = {
@@ -30,10 +38,15 @@
             src = ./.;
             vendorHash = "sha256-ZUEQQ0br+5UQnk/XLM7NLDCd1qA93VOho1iQ3q3RUm8=";
 
+            # The module path is github.com/steveyegge/gastown (go.mod); an -X
+            # naming any other path is silently discarded by the linker, which
+            # is why nix builds reported Build="dev" despite setting it here.
             ldflags = [
-              "-X github.com/gastownhall/gastown/internal/cmd.Build=nix"
+              "-X github.com/steveyegge/gastown/internal/cmd.Build=nix"
               "-X github.com/steveyegge/gastown/internal/cmd.BuiltProperly=1"
-            ];
+            ]
+            ++ pkgs.lib.optional (gtCommit != "")
+              "-X github.com/steveyegge/gastown/internal/cmd.Commit=${gtCommit}";
 
             subPackages = [ "cmd/gt" ];
 
