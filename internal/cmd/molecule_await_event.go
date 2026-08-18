@@ -52,6 +52,15 @@ The rig comes from --rig, else the working directory, else $GT_RIG.
 Town-level channels (mayor, deacon, custom names) stay town-global:
   ~/gt/events/<channel>/
 
+MIGRATION DRAIN:
+A rig-scoped consumer also drains the pre-scoping flat directory
+~/gt/events/<channel>/, so events from a producer still running an older
+binary are not stranded. An event there addressed to another rig is left
+alone; one addressed to nobody (written before producers stamped the rig) is
+shown to each rig's consumer once and never deleted on delivery, since no
+consumer can tell whom it was meant for. --cleanup sweeps those on age
+instead, once they are a day old.
+
 EVENT FORMAT:
 Events are JSON files named *.event in the channel directory:
   {"type": "...", "channel": "...", "rig": "...", "timestamp": "...", "payload": {...}}
@@ -116,6 +125,16 @@ type AwaitEventResult struct {
 type EventFile struct {
 	Path    string          `json:"path"`
 	Content json.RawMessage `json:"content"`
+	// Legacy marks an event read from the pre-rig-scoping flat directory
+	// rather than from this consumer's own one (gt-1qe).
+	Legacy bool `json:"legacy,omitempty"`
+
+	// retain suppresses --cleanup for this file: an unaddressed legacy event
+	// is broadcast to every rig's consumer, so deleting it on delivery would
+	// starve the rig it was actually meant for. Swept on age instead.
+	retain bool
+	// modTime orders legacy events against the delivery cursor.
+	modTime time.Time
 }
 
 func init() {
@@ -155,13 +174,16 @@ func runMoleculeAwaitEvent(cmd *cobra.Command, args []string) error {
 	// Resolve event directory. Rig-scoped channels resolve to the rig's own
 	// directory so this agent only sees events addressed to its rig (gt-em1).
 	townRoot := resolveEventTownRoot()
-	eventDir, _, err := resolveEventDir(townRoot, awaitEventRig, awaitEventChannel)
+	eventDir, rigName, err := resolveEventDir(townRoot, awaitEventRig, awaitEventChannel)
 	if err != nil {
 		return err
 	}
 	if err := os.MkdirAll(eventDir, 0755); err != nil {
 		return fmt.Errorf("creating event directory: %w", err)
 	}
+	// Also drain the pre-rig-scoping directory for the migration window, so
+	// events from a producer that has not been upgraded still arrive (gt-1qe).
+	reader := newChannelReader(townRoot, eventDir, rigName, awaitEventChannel)
 
 	// Read current idle cycles and backoff window from agent bead
 	var idleCycles int
@@ -244,7 +266,7 @@ func runMoleculeAwaitEvent(cmd *cobra.Command, args []string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	result, err := waitForEventFiles(ctx, eventDir, contextCheckInterval)
+	result, err := waitForChannelEvents(ctx, reader, contextCheckInterval)
 	if err != nil {
 		return fmt.Errorf("event watch failed: %w", err)
 	}
@@ -286,8 +308,22 @@ func runMoleculeAwaitEvent(cmd *cobra.Command, args []string) error {
 	// Cleanup event files if requested
 	if awaitEventCleanup && result.Reason == "event" {
 		for _, ef := range result.Events {
+			if ef.retain {
+				// Unaddressed legacy event: other rigs' consumers have not
+				// seen it yet and cannot be told apart from its addressee.
+				continue
+			}
 			_ = os.Remove(ef.Path)
 		}
+	}
+
+	// Record which unaddressed legacy events this consumer has now been shown,
+	// so the next wait does not replay them.
+	if result.Reason == "event" {
+		reader.commitCursor(result.Events)
+	}
+	if awaitEventCleanup {
+		reader.sweepLegacy(time.Now())
 	}
 
 	// Set effort level based on idle cycles.
@@ -315,9 +351,16 @@ func runMoleculeAwaitEvent(cmd *cobra.Command, args []string) error {
 				var parsed map[string]interface{}
 				if json.Unmarshal(ef.Content, &parsed) == nil {
 					if t, ok := parsed["type"].(string); ok {
-						fmt.Printf("  %s %s\n", style.Dim.Render("→"), t)
+						origin := ""
+						if ef.Legacy {
+							origin = style.Dim.Render(" (legacy layout)")
+						}
+						fmt.Printf("  %s %s%s\n", style.Dim.Render("→"), t, origin)
 					}
 				}
+			}
+			if notice := legacyNotice(reader.legacyDir, result.Events); notice != "" {
+				fmt.Printf("%s %s\n", style.Dim.Render("⚠"), notice)
 			}
 		case "timeout":
 			fmt.Printf("%s Timeout after %v (idle cycle: %d)\n",
@@ -386,8 +429,14 @@ func calculateEventTimeout(idleCycles int) (time.Duration, error) {
 // assess context usage before re-entering the wait, preventing unbounded context
 // accumulation during long idle periods.
 func waitForEventFiles(ctx context.Context, eventDir string, contextCheckAfter time.Duration) (*AwaitEventResult, error) {
+	return waitForChannelEvents(ctx, &channelReader{dir: eventDir}, contextCheckAfter)
+}
+
+// waitForChannelEvents is waitForEventFiles over a reader, which may cover the
+// pre-rig-scoping directory in addition to the consumer's own one.
+func waitForChannelEvents(ctx context.Context, reader *channelReader, contextCheckAfter time.Duration) (*AwaitEventResult, error) {
 	// Check for already-pending events
-	events, err := readPendingEvents(eventDir)
+	events, err := reader.read()
 	if err != nil {
 		return nil, err
 	}
@@ -431,7 +480,7 @@ func waitForEventFiles(ctx context.Context, eventDir string, contextCheckAfter t
 			// read so a stuck filesystem can't prevent us from returning —
 			// the wait has already timed out, and reporting timeout is
 			// more useful than hanging indefinitely on the last read.
-			events = readPendingEventsBounded(ctx, eventDir, 500*time.Millisecond)
+			events = readPendingEventsBounded(ctx, reader, 500*time.Millisecond)
 			if len(events) > 0 {
 				return &AwaitEventResult{
 					Reason: "event",
@@ -442,7 +491,7 @@ func waitForEventFiles(ctx context.Context, eventDir string, contextCheckAfter t
 		case <-contextYieldC:
 			// Context-check interval elapsed. Do a final event check before
 			// yielding — if an event just arrived, return it instead.
-			events = readPendingEventsBounded(ctx, eventDir, 500*time.Millisecond)
+			events = readPendingEventsBounded(ctx, reader, 500*time.Millisecond)
 			if len(events) > 0 {
 				return &AwaitEventResult{
 					Reason: "event",
@@ -463,7 +512,7 @@ func waitForEventFiles(ctx context.Context, eventDir string, contextCheckAfter t
 			}
 			ch := make(chan readRes, 1)
 			go func() {
-				ev, er := readPendingEvents(eventDir)
+				ev, er := reader.read()
 				ch <- readRes{events: ev, err: er}
 			}()
 			select {
@@ -489,10 +538,10 @@ func waitForEventFiles(ctx context.Context, eventDir string, contextCheckAfter t
 // readPendingEventsBounded runs readPendingEvents in a goroutine and returns
 // whatever it produces within the given budget, or nil if it doesn't finish.
 // ctx is also honored — whichever deadline fires first wins.
-func readPendingEventsBounded(ctx context.Context, dir string, budget time.Duration) []EventFile {
+func readPendingEventsBounded(ctx context.Context, reader *channelReader, budget time.Duration) []EventFile {
 	ch := make(chan []EventFile, 1)
 	go func() {
-		events, _ := readPendingEvents(dir)
+		events, _ := reader.read()
 		ch <- events
 	}()
 	select {
@@ -539,10 +588,14 @@ func readPendingEvents(dir string) ([]EventFile, error) {
 		if err != nil {
 			continue // skip unreadable files
 		}
-		events = append(events, EventFile{
+		ef := EventFile{
 			Path:    path,
 			Content: json.RawMessage(data),
-		})
+		}
+		if info, statErr := os.Stat(path); statErr == nil {
+			ef.modTime = info.ModTime()
+		}
+		events = append(events, ef)
 	}
 
 	return events, nil

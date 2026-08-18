@@ -13,7 +13,10 @@ func TestEmitToTown(t *testing.T) {
 	townRoot := t.TempDir()
 	AllowEmitForTest(t, townRoot)
 
-	path, err := EmitToTown(townRoot, "refinery", "MERGE_READY", []string{
+	// A town-level channel: "refinery" is rig-scoped and can no longer be
+	// emitted without a rig (gt-1qe), which TestEmitToTown_RigScopedChannelNeedsARig
+	// covers.
+	path, err := EmitToTown(townRoot, "mayor", "MERGE_READY", []string{
 		"source=witness",
 		"rig=dashboard",
 	})
@@ -38,8 +41,8 @@ func TestEmitToTown(t *testing.T) {
 	if event["type"] != "MERGE_READY" {
 		t.Errorf("type = %v, want MERGE_READY", event["type"])
 	}
-	if event["channel"] != "refinery" {
-		t.Errorf("channel = %v, want refinery", event["channel"])
+	if event["channel"] != "mayor" {
+		t.Errorf("channel = %v, want mayor", event["channel"])
 	}
 
 	payload, ok := event["payload"].(map[string]interface{})
@@ -51,6 +54,41 @@ func TestEmitToTown(t *testing.T) {
 	}
 	if payload["rig"] != "dashboard" {
 		t.Errorf("payload.rig = %v, want dashboard", payload["rig"])
+	}
+}
+
+// A rig-scoped channel emitted with no rig would land in the pre-scoping flat
+// directory, which no rig-scoped consumer watches and any consumer still on the
+// old layout may eat (gt-1qe). That is a misdelivery, not a fallback.
+func TestEmitToTown_RigScopedChannelNeedsARig(t *testing.T) {
+	t.Parallel()
+	townRoot := t.TempDir()
+	AllowEmitForTest(t, townRoot)
+
+	for _, channel := range []string{"refinery", "witness"} {
+		if _, err := EmitToTown(townRoot, channel, "MQ_SUBMIT", nil); err == nil {
+			t.Errorf("EmitToTown(%q) with no rig was allowed", channel)
+		}
+		flat := filepath.Join(townRoot, "events", channel)
+		if entries, err := os.ReadDir(flat); err == nil && len(entries) > 0 {
+			t.Errorf("%s: rig-less emit wrote %d entr(ies) to the flat directory", channel, len(entries))
+		}
+	}
+}
+
+// LegacyDir names the pre-scoping directory for rig-scoped channels only: for a
+// town-level channel that same path is the live one, not a legacy one.
+func TestLegacyDir(t *testing.T) {
+	t.Parallel()
+	townRoot := t.TempDir()
+
+	if got, want := LegacyDir(townRoot, "refinery"), filepath.Join(townRoot, "events", "refinery"); got != want {
+		t.Errorf("LegacyDir(refinery) = %q, want %q", got, want)
+	}
+	for _, channel := range []string{"mayor", "deacon", "../escape"} {
+		if got := LegacyDir(townRoot, channel); got != "" {
+			t.Errorf("LegacyDir(%q) = %q, want empty", channel, got)
+		}
 	}
 }
 

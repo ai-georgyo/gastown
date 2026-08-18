@@ -1737,6 +1737,11 @@ func (d *Daemon) ensureWitnessesRunning() {
 // The rig argument matters: the channel directory is per-rig for rig-scoped
 // channels, so a town-global check would spawn every rig's refinery whenever
 // any one rig had a pending event (gt-em1).
+//
+// Deliberately does NOT consider the pre-scoping flat directory that consumers
+// drain (gt-1qe). An unaddressed legacy event there is not deleted on delivery,
+// so gating spawns on it would restart the agent on every heartbeat until the
+// event aged out. Consumers pick those up on their own patrol cycle instead.
 func (d *Daemon) hasPendingEvents(rigName, channel string) bool {
 	eventDir, err := channelevents.Dir(d.config.TownRoot, rigName, channel)
 	if err != nil {

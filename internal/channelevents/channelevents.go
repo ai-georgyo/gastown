@@ -77,6 +77,22 @@ func Dir(townRoot, rig, channel string) (string, error) {
 	return filepath.Join(townRoot, "events", rigsSubdir, rig, channel), nil
 }
 
+// LegacyDir returns the pre-rig-scoping directory for a channel: the flat,
+// role-scoped path <town>/events/<channel>/. It is where producers running a
+// binary from before the rig-scoped layout still write.
+//
+// It is only meaningful for a rig-scoped channel — for a town-level channel it
+// is the live directory, not a legacy one — so it returns "" for anything else.
+// Consumers drain it in addition to their own directory for the duration of the
+// migration, and must not consume from it an event addressed to another rig
+// (gt-1qe).
+func LegacyDir(townRoot, channel string) string {
+	if !IsRigScoped(channel) || !ValidChannelName.MatchString(channel) {
+		return ""
+	}
+	return filepath.Join(townRoot, "events", channel)
+}
+
 // EmitToTown creates an event file on a town-level channel.
 // Used by internal callers that already know the town root.
 func EmitToTown(townRoot, channel, eventType string, payloadPairs []string) (string, error) {
@@ -84,8 +100,18 @@ func EmitToTown(townRoot, channel, eventType string, payloadPairs []string) (str
 }
 
 // EmitToRig creates an event file on a rig's private channel directory.
-// An empty rig is equivalent to EmitToTown.
+// An empty rig is equivalent to EmitToTown, which is an error for a rig-scoped
+// channel: see below.
 func EmitToRig(townRoot, rig, channel, eventType string, payloadPairs []string) (string, error) {
+	// A rig-scoped channel emitted with no rig would land in the pre-scoping
+	// town-level directory. That is not a harmless fallback: it is the flat
+	// layout no rig-scoped consumer watches, so the event is delivered to
+	// nobody it was meant for and is free to be eaten by any consumer still on
+	// the old layout (gt-1qe). Fail instead of misrouting.
+	if rig == "" && IsRigScoped(channel) {
+		return "", fmt.Errorf("channel %q is rig-scoped: emitting with no rig would write the "+
+			"pre-scoping town-level directory, which no rig's consumer watches", channel)
+	}
 	eventDir, err := Dir(townRoot, rig, channel)
 	if err != nil {
 		return "", err
