@@ -276,21 +276,17 @@ func runEscalateList(cmd *cobra.Command, args []string) error {
 
 	bd := beads.New(beads.ResolveBeadsDir(townRoot))
 
+	// Both branches go through the beads package so that --all and the default
+	// view answer with the same rows: the escalation records, one per
+	// escalation, not the per-recipient mail copies (gt-c6x).
 	var issues []*beads.Issue
 	if escalateListAll {
-		// List all (open and closed)
-		out, err := bd.Run("list", "--label=gt:escalation", "--status=all", "--json")
-		if err != nil {
-			return fmt.Errorf("listing escalations: %w", err)
-		}
-		if err := json.Unmarshal(out, &issues); err != nil {
-			return fmt.Errorf("parsing escalations: %w", err)
-		}
+		issues, err = bd.ListAllEscalations()
 	} else {
 		issues, err = bd.ListEscalations()
-		if err != nil {
-			return fmt.Errorf("listing escalations: %w", err)
-		}
+	}
+	if err != nil {
+		return fmt.Errorf("listing escalations: %w", err)
 	}
 
 	// Cross-check each entry against live Dolt to filter out phantom escalations.

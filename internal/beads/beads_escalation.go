@@ -299,9 +299,26 @@ func (b *Beads) GetEscalationBead(id string) (*Issue, *EscalationFields, error) 
 	return issue, fields, nil
 }
 
-// ListEscalations returns all open escalation beads.
-func (b *Beads) ListEscalations() ([]*Issue, error) {
-	out, err := b.run("list", "--label=gt:escalation", "--status=open", "--json")
+// escalationListArgs builds a `bd list` invocation for escalation beads.
+//
+// --include-infra is mandatory. CreateEscalationBead writes the escalation
+// record as an ephemeral wisp, which bd classifies as an infrastructure bead
+// and hides from `bd list` by default. Without the flag the query can only
+// ever return the mail copies of an escalation, never the record itself, and
+// filterEscalationRecords then removes those — a permanent empty result
+// (gt-c6x).
+func escalationListArgs(status string, labels ...string) []string {
+	args := []string{"list", "--label=gt:escalation"}
+	for _, label := range labels {
+		args = append(args, "--label="+label)
+	}
+	return append(args, "--status="+status, "--include-infra", "--json")
+}
+
+// listEscalationRecords runs a bd list query and reduces it to one row per
+// escalation.
+func (b *Beads) listEscalationRecords(args []string) ([]*Issue, error) {
+	out, err := b.run(args...)
 	if err != nil {
 		return nil, err
 	}
@@ -312,6 +329,16 @@ func (b *Beads) ListEscalations() ([]*Issue, error) {
 	}
 
 	return filterEscalationRecords(issues), nil
+}
+
+// ListEscalations returns all open escalation beads.
+func (b *Beads) ListEscalations() ([]*Issue, error) {
+	return b.listEscalationRecords(escalationListArgs("open"))
+}
+
+// ListAllEscalations returns every escalation bead, open and closed.
+func (b *Beads) ListAllEscalations() ([]*Issue, error) {
+	return b.listEscalationRecords(escalationListArgs("all"))
 }
 
 // ListEscalationsByFingerprint returns open escalation beads matching a stable fingerprint label.
@@ -319,49 +346,77 @@ func (b *Beads) ListEscalationsByFingerprint(fingerprintLabel string) ([]*Issue,
 	if fingerprintLabel == "" {
 		return nil, nil
 	}
-	out, err := b.run("list",
-		"--label=gt:escalation",
-		"--label="+fingerprintLabel,
-		"--status=open",
-		"--json",
-	)
-	if err != nil {
-		return nil, err
-	}
-
-	var issues []*Issue
-	if err := json.Unmarshal(out, &issues); err != nil {
-		return nil, fmt.Errorf("parsing bd list output: %w", err)
-	}
-
-	return filterEscalationRecords(issues), nil
+	return b.listEscalationRecords(escalationListArgs("open", fingerprintLabel))
 }
 
 // ListEscalationsBySeverity returns open escalation beads filtered by severity.
 func (b *Beads) ListEscalationsBySeverity(severity string) ([]*Issue, error) {
-	out, err := b.run("list",
-		"--label=gt:escalation",
-		"--label=severity:"+severity,
-		"--status=open",
-		"--json",
-	)
-	if err != nil {
-		return nil, err
-	}
-
-	var issues []*Issue
-	if err := json.Unmarshal(out, &issues); err != nil {
-		return nil, fmt.Errorf("parsing bd list output: %w", err)
-	}
-
-	return filterEscalationRecords(issues), nil
+	return b.listEscalationRecords(escalationListArgs("open", "severity:"+severity))
 }
 
+// isEscalationMailCopy reports whether an escalation-labelled bead is a mail
+// delivery of an escalation rather than the escalation record itself. Only the
+// mail router labels a bead gt:message.
+func isEscalationMailCopy(issue *Issue) bool {
+	return HasLabel(issue, "gt:message")
+}
+
+// escalationRecordID returns the ID of the escalation record a mail copy was
+// delivered for, or "" when the copy carries no back-reference. `gt escalate`
+// annotates the mail with escalation:<record id>; the mail router always sets
+// thread:<record id>, so the thread label is the reliable fallback.
+func escalationRecordID(issue *Issue) string {
+	if issue == nil {
+		return ""
+	}
+	var thread string
+	for _, label := range issue.Labels {
+		if id, ok := strings.CutPrefix(label, "escalation:"); ok {
+			return id
+		}
+		if id, ok := strings.CutPrefix(label, "thread:"); ok {
+			thread = id
+		}
+	}
+	return thread
+}
+
+// filterEscalationRecords reduces a bd list result to one row per escalation.
+//
+// A single `gt escalate` writes several beads: the escalation record itself
+// (no gt:message label) and one mail copy per routed target, each carrying
+// gt:message and a back-reference to the record. Listing every one of them
+// would show the same escalation once per recipient, so mail copies are
+// collapsed onto their record.
+//
+// This used to drop every gt:message bead unconditionally. Combined with bd
+// hiding the wisp-backed records from `bd list`, that removed 100% of the
+// filter's own input: `gt escalate list` reported a confident "No escalations
+// found" while HIGH escalations sat open (gt-c6x). A mail copy is therefore
+// only dropped when the record it points at is present in the same result, or
+// when an earlier copy of the same escalation was already kept. An escalation
+// whose record is missing still yields exactly one row rather than vanishing.
 func filterEscalationRecords(issues []*Issue) []*Issue {
-	filtered := issues[:0]
+	records := make(map[string]bool, len(issues))
 	for _, issue := range issues {
-		if HasLabel(issue, "gt:message") {
+		if !isEscalationMailCopy(issue) {
+			records[issue.ID] = true
+		}
+	}
+
+	filtered := make([]*Issue, 0, len(issues))
+	seen := make(map[string]bool, len(issues))
+	for _, issue := range issues {
+		if !isEscalationMailCopy(issue) {
+			filtered = append(filtered, issue)
 			continue
+		}
+		recordID := escalationRecordID(issue)
+		if recordID != "" {
+			if records[recordID] || seen[recordID] {
+				continue
+			}
+			seen[recordID] = true
 		}
 		filtered = append(filtered, issue)
 	}

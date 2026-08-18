@@ -325,15 +325,247 @@ func TestEscalationFieldsRoundTrip(t *testing.T) {
 	}
 }
 
-func TestFilterEscalationRecordsSkipsMailMessages(t *testing.T) {
-	issues := []*Issue{
-		{ID: "hq-root", Labels: []string{"gt:escalation"}},
-		{ID: "hq-mail", Labels: []string{"gt:escalation", "gt:message"}},
+func TestFilterEscalationRecords(t *testing.T) {
+	tests := []struct {
+		name   string
+		issues []*Issue
+		want   []string
+	}{
+		{
+			name: "mail copy collapses onto its record",
+			issues: []*Issue{
+				{ID: "hq-root", Labels: []string{"gt:escalation"}},
+				{ID: "hq-mail", Labels: []string{"gt:escalation", "gt:message", "thread:hq-root"}},
+			},
+			want: []string{"hq-root"},
+		},
+		{
+			name: "one row per recipient collapses to one row",
+			issues: []*Issue{
+				{ID: "hq-root", Labels: []string{"gt:escalation"}},
+				{ID: "hq-mail-mayor", Labels: []string{"gt:escalation", "gt:message", "escalation:hq-root"}},
+				{ID: "hq-mail-overseer", Labels: []string{"gt:escalation", "gt:message", "escalation:hq-root"}},
+			},
+			want: []string{"hq-root"},
+		},
+		{
+			name: "mail copies survive when their record is absent",
+			issues: []*Issue{
+				{ID: "hq-mail-mayor", Labels: []string{"gt:escalation", "gt:message", "thread:hq-root"}},
+				{ID: "hq-mail-overseer", Labels: []string{"gt:escalation", "gt:message", "thread:hq-root"}},
+			},
+			want: []string{"hq-mail-mayor"},
+		},
+		{
+			name: "unrelated escalations are not collapsed together",
+			issues: []*Issue{
+				{ID: "hq-mail-a", Labels: []string{"gt:escalation", "gt:message", "thread:hq-root-a"}},
+				{ID: "hq-mail-b", Labels: []string{"gt:escalation", "gt:message", "thread:hq-root-b"}},
+			},
+			want: []string{"hq-mail-a", "hq-mail-b"},
+		},
+		{
+			name: "mail copy with no back-reference is kept",
+			issues: []*Issue{
+				{ID: "hq-mail-orphan", Labels: []string{"gt:escalation", "gt:message"}},
+			},
+			want: []string{"hq-mail-orphan"},
+		},
+		{
+			name: "records only",
+			issues: []*Issue{
+				{ID: "hq-root-a", Labels: []string{"gt:escalation"}},
+				{ID: "hq-root-b", Labels: []string{"gt:escalation"}},
+			},
+			want: []string{"hq-root-a", "hq-root-b"},
+		},
 	}
 
-	got := filterEscalationRecords(issues)
-	if len(got) != 1 || got[0].ID != "hq-root" {
-		t.Fatalf("filterEscalationRecords() = %#v, want only root escalation", got)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := filterEscalationRecords(tt.issues)
+			// Assert on the row count against a known population: an
+			// exit-status or "did not error" assertion passes even when the
+			// filter has eaten every row (gt-c6x).
+			if len(got) != len(tt.want) {
+				t.Fatalf("filterEscalationRecords() returned %d rows, want %d: %#v", len(got), len(tt.want), got)
+			}
+			for i, want := range tt.want {
+				if got[i].ID != want {
+					t.Errorf("row %d = %s, want %s", i, got[i].ID, want)
+				}
+			}
+		})
+	}
+}
+
+// escalationListStub installs a fake bd that reproduces the two behaviours
+// that together produced gt-c6x: escalation records are ephemeral wisps that
+// `bd list` hides unless --include-infra is passed, and every escalation is
+// also delivered as mail, so the mail copies carry gt:message.
+func escalationListStub(t *testing.T) string {
+	t.Helper()
+
+	stubDir := t.TempDir()
+	argsPath := filepath.Join(stubDir, "args.txt")
+
+	const record = `{"id":"hq-wisp-1","title":"Disk full","description":"Disk full\n\nseverity: high\nescalated_by: deacon/boot\n","status":"open","priority":1,"type":"task","labels":["gt:escalation","severity:high"]}`
+	const mailMayor = `{"id":"hq-mail-1","title":"[HIGH] Disk full","description":"Escalation ID: hq-wisp-1\nSeverity: high\n","status":"open","priority":1,"type":"task","labels":["gt:escalation","gt:message","msg-type:escalation","thread:hq-wisp-1"]}`
+	const mailOverseer = `{"id":"hq-mail-2","title":"[HIGH] Disk full","description":"Escalation ID: hq-wisp-1\nSeverity: high\n","status":"open","priority":1,"type":"task","labels":["gt:escalation","gt:message","msg-type:escalation","thread:hq-wisp-1"]}`
+
+	stubScript := `#!/bin/sh
+sub=""
+target=""
+infra=0
+for a in "$@"; do
+  case "$a" in
+    --include-infra) infra=1 ;;
+    -*) ;;
+    *)
+      if [ -z "$sub" ]; then sub="$a"
+      elif [ -z "$target" ]; then target="$a"
+      fi
+      ;;
+  esac
+done
+if [ "$sub" = "list" ]; then
+  for a in "$@"; do printf '%s
+' "$a" >> "` + argsPath + `"; done
+  if [ "$infra" = "1" ]; then
+    printf '%s\n' '[` + record + `,` + mailMayor + `,` + mailOverseer + `]'
+  else
+    printf '%s\n' '[` + mailMayor + `,` + mailOverseer + `]'
+  fi
+  exit 0
+fi
+if [ "$sub" = "show" ]; then
+  case "$target" in
+    hq-wisp-1) printf '%s\n' '[` + record + `]' ;;
+    hq-mail-1) printf '%s\n' '[` + mailMayor + `]' ;;
+    hq-mail-2) printf '%s\n' '[` + mailOverseer + `]' ;;
+    *) printf '%s\n' '[]' ;;
+  esac
+  exit 0
+fi
+printf '%s\n' '[]'
+exit 0
+`
+	if err := os.WriteFile(filepath.Join(stubDir, "bd"), []byte(stubScript), 0755); err != nil {
+		t.Fatalf("write bd stub: %v", err)
+	}
+	t.Setenv("PATH", stubDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	ResetBdAllowStaleCacheForTest()
+
+	return argsPath
+}
+
+// TestListEscalationsReturnsOpenEscalations is the regression test for gt-c6x:
+// `gt escalate list` could never return a row. bd hides the wisp-backed
+// escalation records, and the filter dropped every remaining mail copy, so the
+// command reported a confident "No escalations found" with exit 0 while open
+// escalations existed. Asserting the row count against a known population is
+// the point — "the command succeeded" passes against the broken code.
+func TestListEscalationsReturnsOpenEscalations(t *testing.T) {
+	argsPath := escalationListStub(t)
+
+	b := New(t.TempDir())
+	got, err := b.ListEscalations()
+	if err != nil {
+		t.Fatalf("ListEscalations: %v", err)
+	}
+
+	// Population is one escalation: one record plus two mail copies.
+	if len(got) != 1 {
+		t.Fatalf("ListEscalations() returned %d rows, want 1: %#v", len(got), got)
+	}
+	if got[0].ID != "hq-wisp-1" {
+		t.Errorf("ListEscalations() = %s, want the escalation record hq-wisp-1", got[0].ID)
+	}
+
+	argsData, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatalf("read stub args: %v", err)
+	}
+	if !strings.Contains(string(argsData), "--include-infra") {
+		t.Errorf("bd list args missing --include-infra (escalation records are wisps):\n%s", argsData)
+	}
+}
+
+// TestListEscalationsAgreesWithShow covers the second half of gt-c6x: `gt
+// escalate show <id>` rendered a bead that `gt escalate list` claimed did not
+// exist. Every id the list returns must resolve through the show path.
+func TestListEscalationsAgreesWithShow(t *testing.T) {
+	escalationListStub(t)
+
+	b := New(t.TempDir())
+	listed, err := b.ListEscalations()
+	if err != nil {
+		t.Fatalf("ListEscalations: %v", err)
+	}
+	if len(listed) == 0 {
+		t.Fatal("ListEscalations() returned no rows, nothing to reconcile with show")
+	}
+
+	for _, issue := range listed {
+		shown, fields, err := b.GetEscalationBead(issue.ID)
+		if err != nil {
+			t.Fatalf("GetEscalationBead(%s): %v", issue.ID, err)
+		}
+		if shown == nil {
+			t.Fatalf("list returned %s but show reports it does not exist", issue.ID)
+		}
+		if shown.ID != issue.ID {
+			t.Errorf("show returned %s for listed id %s", shown.ID, issue.ID)
+		}
+		if fields.Severity == "" {
+			t.Errorf("show parsed no severity for %s", issue.ID)
+		}
+	}
+}
+
+func TestListAllEscalationsIncludesClosed(t *testing.T) {
+	argsPath := escalationListStub(t)
+
+	b := New(t.TempDir())
+	got, err := b.ListAllEscalations()
+	if err != nil {
+		t.Fatalf("ListAllEscalations: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != "hq-wisp-1" {
+		t.Fatalf("ListAllEscalations() = %#v, want the escalation record hq-wisp-1", got)
+	}
+
+	argsData, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatalf("read stub args: %v", err)
+	}
+	args := string(argsData)
+	for _, want := range []string{"--status=all", "--include-infra"} {
+		if !strings.Contains(args, want) {
+			t.Errorf("bd list args missing %s:\n%s", want, args)
+		}
+	}
+}
+
+func TestEscalationRecordID(t *testing.T) {
+	tests := []struct {
+		name  string
+		issue *Issue
+		want  string
+	}{
+		{"escalation label wins", &Issue{Labels: []string{"thread:hq-b", "escalation:hq-a"}}, "hq-a"},
+		{"thread label is the fallback", &Issue{Labels: []string{"gt:message", "thread:hq-b"}}, "hq-b"},
+		{"no back-reference", &Issue{Labels: []string{"gt:escalation", "gt:message"}}, ""},
+		{"gt:escalation is not a back-reference", &Issue{Labels: []string{"gt:escalation"}}, ""},
+		{"nil issue", nil, ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := escalationRecordID(tt.issue); got != tt.want {
+				t.Errorf("escalationRecordID() = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }
 
