@@ -1011,3 +1011,95 @@ func TestIsRigOperational_DockedRig(t *testing.T) {
 	}
 	t.Logf("Docked rig check returned: operational=%v, reason=%q", operational, reason)
 }
+
+// mkGt writes an executable named gt into dir and returns the directory.
+func mkGt(t *testing.T, dir string) string {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir %s: %v", dir, err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "gt"), []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatalf("write gt in %s: %v", dir, err)
+	}
+	return dir
+}
+
+func TestGtDirForChildrenKeepsOrdinaryInstallDir(t *testing.T) {
+	dir, pinned := gtDirForChildren("/home/alice", "/usr/local/bin/gt", func(string) bool { return true })
+	if dir != "/usr/local/bin" || pinned {
+		t.Fatalf("gtDirForChildren(/usr/local/bin/gt) = (%q, %v), want (/usr/local/bin, false)", dir, pinned)
+	}
+}
+
+func TestGtDirForChildrenPrefersProfileAliasOverStorePath(t *testing.T) {
+	home := "/home/alice"
+	profile := filepath.Join(home, ".nix-profile/bin")
+	dir, pinned := gtDirForChildren(home, "/nix/store/deadbeef-gt-1.0.0/bin/gt", func(d string) bool {
+		return d == profile
+	})
+	if dir != profile || pinned {
+		t.Fatalf("gtDirForChildren(store exe) = (%q, %v), want (%q, false)", dir, pinned, profile)
+	}
+}
+
+func TestGtDirForChildrenFallsBackToStoreWhenNoAlias(t *testing.T) {
+	exeDir := "/nix/store/deadbeef-gt-1.0.0/bin"
+	dir, pinned := gtDirForChildren("/home/alice", filepath.Join(exeDir, "gt"), func(string) bool { return false })
+	if dir != exeDir || !pinned {
+		t.Fatalf("gtDirForChildren(store exe, no alias) = (%q, %v), want (%q, true)", dir, pinned, exeDir)
+	}
+}
+
+// TestAugmentDaemonPathHandsChildrenNoPinnedGt is the acceptance test for
+// gt-5v2: the PATH the daemon hands to every session it spawns must not name a
+// single build of gt, and gt must still resolve — through the profile symlink,
+// which follows rebuilds.
+func TestAugmentDaemonPathHandsChildrenNoPinnedGt(t *testing.T) {
+	tmp := t.TempDir()
+	storeRoot := filepath.Join(tmp, "store")
+
+	oldPrefixes := storePathPrefixes
+	storePathPrefixes = []string{storeRoot + string(os.PathSeparator)}
+	t.Cleanup(func() { storePathPrefixes = oldPrefixes })
+
+	current := mkGt(t, filepath.Join(storeRoot, "aaaa-gt-1.0.0", "bin"))
+	stale := mkGt(t, filepath.Join(storeRoot, "bbbb-gt-1.0.0", "bin"))
+
+	home := filepath.Join(tmp, "home")
+	profile := filepath.Join(home, ".nix-profile", "bin")
+	if err := os.MkdirAll(profile, 0o755); err != nil {
+		t.Fatalf("mkdir profile: %v", err)
+	}
+	if err := os.Symlink(filepath.Join(current, "gt"), filepath.Join(profile, "gt")); err != nil {
+		t.Fatalf("symlink profile gt: %v", err)
+	}
+
+	oldExe := daemonExecutable
+	daemonExecutable = func() (string, error) { return filepath.Join(current, "gt"), nil }
+	t.Cleanup(func() { daemonExecutable = oldExe })
+
+	// The daemon inherits a PATH already pinned by an earlier daemon.
+	t.Setenv("HOME", home)
+	t.Setenv("PATH", strings.Join([]string{stale, "/usr/bin"}, string(os.PathListSeparator)))
+
+	var logs bytes.Buffer
+	augmentDaemonPath(log.New(&logs, "", 0))
+
+	got := strings.Split(os.Getenv("PATH"), string(os.PathListSeparator))
+	for _, entry := range got {
+		if strings.HasPrefix(entry, storeRoot+string(os.PathSeparator)) {
+			t.Errorf("child PATH still names a single gt build: %q (PATH=%v)\nlogs:\n%s", entry, got, logs.String())
+		}
+	}
+	if got[0] != profile {
+		t.Errorf("head of child PATH = %q, want profile dir %q (PATH=%v)", got[0], profile, got)
+	}
+
+	resolved, err := exec.LookPath("gt")
+	if err != nil {
+		t.Fatalf("gt no longer resolves under the child PATH: %v (PATH=%v)", err, got)
+	}
+	if resolved != filepath.Join(profile, "gt") {
+		t.Errorf("gt resolves to %q, want it to go through the profile symlink %q", resolved, filepath.Join(profile, "gt"))
+	}
+}

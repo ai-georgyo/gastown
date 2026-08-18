@@ -158,10 +158,80 @@ const beadsModulePath = "github.com/steveyegge/beads"
 
 var semverPattern = regexp.MustCompile(`v?(\d+\.\d+\.\d+)`)
 
+// storePathPrefixes are content-addressed package store roots. A binary under
+// one of these is pinned to a single build: the path changes on every rebuild,
+// so baking it into PATH hands every descendant process a binary that goes
+// stale the next time gt is rebuilt (gt-5v2, root cause of gt-3pk).
+var storePathPrefixes = []string{"/nix/store/", "/gnu/store/"}
+
+func isStorePath(dir string) bool {
+	for _, prefix := range storePathPrefixes {
+		if strings.HasPrefix(dir, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// gtAliasDirs lists directories whose gt is a package-manager symlink or a
+// hand-installed binary: the name stays put while the target moves, so they
+// keep resolving to the current build across rebuilds. Preference order.
+func gtAliasDirs(home string) []string {
+	if home == "" {
+		return nil
+	}
+	return []string{
+		filepath.Join(home, ".nix-profile/bin"),
+		filepath.Join(home, ".local/state/nix/profiles/profile/bin"),
+		filepath.Join(home, ".local/bin"),
+		filepath.Join(home, "bin"),
+	}
+}
+
+func hasGtExecutable(dir string) bool {
+	info, err := os.Stat(filepath.Join(dir, "gt"))
+	return err == nil && !info.IsDir() && info.Mode().Perm()&0o111 != 0
+}
+
+// gtDirForChildren picks the directory that goes at the head of the daemon PATH
+// so child sessions can run gt, and reports whether that directory is pinned to
+// one build.
+//
+// It never returns the realpath of the running binary when an upgrade-following
+// alias exists. os.Executable() resolves symlinks, so under nix it is
+// /nix/store/<hash>-gt-<ver>/bin/gt; prepending that dir froze the daemon and
+// every descendant session on whichever build happened to be current at daemon
+// start, forever (gt-5v2). Resolving through the profile instead means a rebuild
+// is picked up by everything that has not been re-exec'd.
+func gtDirForChildren(home, exePath string, hasGt func(dir string) bool) (dir string, pinned bool) {
+	if exePath == "" {
+		return "", false
+	}
+	exeDir := filepath.Dir(exePath)
+	if !isStorePath(exeDir) {
+		// Ordinary install prefix (/usr/local/bin, /opt/homebrew/bin,
+		// ~/.local/bin): the path survives upgrades, so it is safe to pass on.
+		return exeDir, false
+	}
+	for _, alias := range gtAliasDirs(home) {
+		if hasGt(alias) {
+			return alias, false
+		}
+	}
+	// Store install with no alias anywhere. A pinned gt beats no gt, but it is
+	// stale the moment gt is rebuilt, so the caller logs it.
+	return exeDir, true
+}
+
 func daemonPathCandidates(home, exePath string) []string {
+	gtDir, _ := gtDirForChildren(home, exePath, hasGtExecutable)
+	return daemonPathCandidatesFrom(home, gtDir)
+}
+
+func daemonPathCandidatesFrom(home, gtDir string) []string {
 	candidates := make([]string, 0, 5)
-	if exePath != "" {
-		candidates = append(candidates, filepath.Dir(exePath))
+	if gtDir != "" {
+		candidates = append(candidates, gtDir)
 	}
 	if home != "" {
 		candidates = append(candidates,
@@ -175,18 +245,33 @@ func daemonPathCandidates(home, exePath string) []string {
 	)
 }
 
+// daemonExecutable is os.Executable, indirected so tests can stand in a fake
+// install layout for it.
+var daemonExecutable = os.Executable
+
 func augmentDaemonPath(logger *log.Logger) {
 	exePath := ""
-	if exe, err := os.Executable(); err == nil {
+	if exe, err := daemonExecutable(); err == nil {
 		exePath = exe
 	}
-	extras := daemonPathCandidates(os.Getenv("HOME"), exePath)
+	home := os.Getenv("HOME")
+	gtDir, pinned := gtDirForChildren(home, exePath, hasGtExecutable)
+	if exePath != "" && gtDir != filepath.Dir(exePath) {
+		logger.Printf("PATCH-007: gt runs from store path %q; giving children %q instead so they follow upgrades", filepath.Dir(exePath), gtDir)
+	}
+	if pinned {
+		logger.Printf("PATCH-007: WARNING gt runs from store path %q and no profile alias points at a gt; children are pinned to this build until the daemon restarts", gtDir)
+	}
+	extras := daemonPathCandidatesFrom(home, gtDir)
 	if len(extras) == 0 {
 		return
 	}
 
 	current := os.Getenv("PATH")
 	parts := strings.Split(current, string(os.PathListSeparator))
+	if !pinned {
+		parts = dropPinnedGtDirs(parts, hasGtExecutable, logger)
+	}
 	seen := make(map[string]struct{}, len(parts)+len(extras))
 	for _, p := range parts {
 		seen[p] = struct{}{}
@@ -207,6 +292,22 @@ func augmentDaemonPath(logger *log.Logger) {
 		_ = os.Setenv("PATH", newPath)
 		logger.Printf("PATCH-007: augmented daemon PATH with user/local bin dirs (was=%q, now=%q)", current, newPath)
 	}
+}
+
+// dropPinnedGtDirs removes inherited PATH entries that are a store path holding
+// a gt. The daemon is normally started by a gt that already had such an entry
+// prepended by an earlier daemon, so without this the stale pin survives in
+// every child's PATH even though the profile dir now precedes it.
+func dropPinnedGtDirs(parts []string, hasGt func(dir string) bool, logger *log.Logger) []string {
+	kept := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if isStorePath(p) && hasGt(p) {
+			logger.Printf("PATCH-007: dropping pinned gt store dir %q from daemon PATH", p)
+			continue
+		}
+		kept = append(kept, p)
+	}
+	return kept
 }
 
 var cleanupLegacySocketsForDaemon = func(townRoot string) (int, int) {
